@@ -1,5 +1,5 @@
 /*
- * EltonTV / CineSrc for Lampa - 2.3.0 (Samsung TV remote edition)
+ * EltonTV / CineSrc for Lampa - 2.3.1 (Samsung TV remote edition)
  *
  * Full-viewport CineSrc iframe driven through CineSrc's postMessage API.
  * While the player is open every remote key is handled here and none reach
@@ -30,8 +30,8 @@
 (function () {
     'use strict';
 
-    if (window.eltontv_cinesrc_remote_230) return;
-    window.eltontv_cinesrc_remote_230 = true;
+    if (window.eltontv_cinesrc_remote_231) return;
+    window.eltontv_cinesrc_remote_231 = true;
 
     var ORIGIN = 'https://cinesrc.st';
     var CONTROLLER = 'eltontv_cinesrc_remote';
@@ -100,6 +100,21 @@
     };
     var FEATURE_ORDER = ['subtitles', 'quality', 'audio', 'speed'];
 
+    // Diagnostics > "Try more command names" asks the player for each of
+    // these once. They only read state, so trying them changes nothing.
+    var EXTRA_PROBES = [
+        'getDuration', 'getMuted', 'getEnded', 'getBuffered', 'getState', 'getPlayerState',
+        'getInfo', 'getVideoInfo', 'getMeta', 'getMetadata',
+        'getSubtitle', 'getSubtitleTracks', 'getSubtitleTrack', 'getCurrentSubtitle',
+        'getSubtitleLanguage', 'getTextTrack', 'getCaption', 'getCaptionTracks', 'getTracks',
+        'getQuality', 'getCurrentQuality', 'getQualityLevel', 'getLevels', 'getLevel',
+        'getCurrentLevel', 'getVideoQuality', 'getResolution', 'getResolutions',
+        'getAudioTrack', 'getCurrentAudioTrack', 'getAudioLanguages', 'getLanguages', 'getLanguage',
+        'getSource', 'getSources', 'getCurrentSource', 'getServer', 'getServers',
+        'getCurrentServer', 'getProvider', 'getProviders',
+        'getEpisode', 'getSeason', 'getMethods', 'getCommands', 'getCapabilities'
+    ];
+
     var FLEX_ROW = 'display:-webkit-box;display:-webkit-flex;display:flex;' +
         '-webkit-box-pack:justify;-webkit-justify-content:space-between;justify-content:space-between;';
     var ROW_CSS = FLEX_ROW + '-webkit-box-align:center;-webkit-align-items:center;align-items:center;' +
@@ -108,6 +123,7 @@
     var VALUE_CSS = 'opacity:0.7;margin-left:2vh;text-align:right;';
     var VALUE_STACKED_CSS = 'display:block;margin-top:0.4vh;word-wrap:break-word;';
     var LABEL_STACKED_CSS = 'display:block;opacity:0.7;font-size:2.1vh;';
+    var DETAIL_CSS = 'font-size:2.1vh;';
     var DOT_CSS = 'display:inline-block;width:1.1vh;height:1.1vh;margin-right:1.4vh;' +
         'border-radius:50%;background:currentColor;vertical-align:middle;';
 
@@ -189,7 +205,7 @@
         for (i = 0; i < FEATURE_ORDER.length; i++) {
             feat[FEATURE_ORDER[i]] = { status: 'checking', variant: null, options: [], current: null };
         }
-        diag = { types: {}, asked: {}, answered: {}, foreign: '' };
+        diag = { types: {}, last: {}, asked: {}, answered: {}, results: {}, foreign: '' };
     }
     resetLoad();
 
@@ -212,6 +228,21 @@
             if (arguments[i] !== undefined && arguments[i] !== null && arguments[i] !== '') return arguments[i];
         }
         return undefined;
+    }
+
+    // Short JSON of a message, without the fields named in `skip`.
+    function compact(data, skip) {
+        var copy = data;
+        var text, key;
+        if (data && typeof data === 'object' && !isArray(data) && skip) {
+            copy = {};
+            for (key in data) {
+                if (skip.indexOf(key) < 0) copy[key] = data[key];
+            }
+        }
+        try { text = JSON.stringify(copy); } catch (e) { text = String(copy); }
+        if (text === undefined) text = 'nothing';
+        return text.length > 300 ? text.slice(0, 300) + '...' : text;
     }
 
     function validTmdbId(id) {
@@ -864,7 +895,7 @@
         row.style.cssText = (item.stacked ? ROW_STACKED_CSS : ROW_CSS) +
             (focused ? 'background:#fff;color:#000;' : '') +
             (item.disabled ? 'opacity:0.4;' : '');
-        if (item.stacked) label.style.cssText = LABEL_STACKED_CSS;
+        if (item.stacked) label.style.cssText = LABEL_STACKED_CSS + (focused ? 'opacity:1;' : '');
         if (typeof item.current === 'boolean') {
             dot = document.createElement('span');
             dot.style.cssText = DOT_CSS + (item.current ? '' : 'visibility:hidden;');
@@ -874,7 +905,8 @@
         row.appendChild(label);
         if (item.value) {
             value = document.createElement('span');
-            value.style.cssText = item.stacked ? VALUE_STACKED_CSS : VALUE_CSS;
+            value.style.cssText = (item.stacked ? VALUE_STACKED_CSS : VALUE_CSS) +
+                (item.small ? DETAIL_CSS : '');
             value.textContent = item.value;
             row.appendChild(value);
         }
@@ -1118,7 +1150,7 @@
         items.push({ label: 'Start from the beginning', action: restart });
         items.push({
             label: pointerMode ? 'Back to the remote' : 'CineSrc\'s own controls',
-            value: pointerMode ? '' : 'pointer or mouse',
+            value: pointerMode ? '' : 'needs a mouse',
             action: function () { setPointerMode(!pointerMode); }
         });
         items.push({
@@ -1140,12 +1172,26 @@
             else silent.push(key);
         }
         items.push({
+            label: 'Try more command names',
+            value: ready ? EXTRA_PROBES.length + ' names' : 'player not ready',
+            disabled: !ready,
+            action: tryMoreCommands
+        });
+        items.push({
+            label: 'Message details',
+            action: function () { pushLevel('Message details', buildDetails); }
+        });
+        items.push({
             label: 'Messages from the player',
             value: types.length ? types.join(', ') : 'none - the player is not talking to this plugin',
             stacked: true
         });
         items.push({ label: 'Commands it answered', value: answered.join(', ') || 'none', stacked: true });
-        items.push({ label: 'Commands it ignored', value: silent.join(', ') || 'none', stacked: true });
+        items.push({
+            label: 'Commands it ignored',
+            value: silent.length > 10 ? silent.length + ' of the names tried' : silent.join(', ') || 'none',
+            stacked: true
+        });
         items.push({ label: 'Expected player address', value: ORIGIN, stacked: true });
         if (diag.foreign) {
             items.push({ label: 'Messages ignored from', value: diag.foreign, stacked: true });
@@ -1156,6 +1202,43 @@
                 ', ' + timeLabel(),
             stacked: true
         });
+        return items;
+    }
+
+    function tryMoreCommands() {
+        if (!ready) return;
+        for (var i = 0; i < EXTRA_PROBES.length; i++) request(EXTRA_PROBES[i]);
+        osd('Asking the player', EXTRA_PROBES.length + ' names', 0);
+        refreshMenu();
+    }
+
+    // What each answer and each kind of message actually contained. The
+    // unusual messages come first: they say the most about the player.
+    function buildDetails() {
+        var routine = ['cinesrc:play', 'cinesrc:pause', 'cinesrc:seeking', 'cinesrc:seeked',
+            'cinesrc:loadedmetadata', 'cinesrc:timeupdate'];
+        var items = [];
+        var key, i;
+
+        function message(type) {
+            items.push({
+                label: type.replace('cinesrc:', '') + ' message',
+                value: diag.last[type],
+                stacked: true,
+                small: true
+            });
+        }
+
+        for (key in diag.last) {
+            if (routine.indexOf(key) < 0) message(key);
+        }
+        for (key in diag.results) {
+            items.push({ label: key + ' answered', value: diag.results[key], stacked: true, small: true });
+        }
+        for (i = 0; i < routine.length; i++) {
+            if (diag.last[routine[i]]) message(routine[i]);
+        }
+        if (!items.length) items.push({ label: 'Nothing received yet', stacked: true });
         return items;
     }
 
@@ -1174,6 +1257,7 @@
         var queued, hit;
         if (typeof command !== 'string') return;
         diag.answered[command] = true;
+        diag.results[command] = compact(data, ['type', 'command']);
 
         if (command === 'getPaused') {
             settle('getPaused');
@@ -1202,6 +1286,7 @@
             settle(command);
             hit = findProbe(command);
             if (hit) onFeatureResponse(hit, data);
+            else refreshMenu();
         }
     }
 
@@ -1218,6 +1303,7 @@
 
         var fresh = !diag.types[type];
         diag.types[type] = (diag.types[type] || 0) + 1;
+        if (type !== 'cinesrc:response') diag.last[type] = compact(data, ['type']);
         if (!ready) {
             ready = true; // any message from the player means it is listening
             syncPlayer(true);
@@ -1698,7 +1784,7 @@
         if (Lampa.Manifest) {
             Lampa.Manifest.plugins = {
                 type: 'video',
-                version: '2.3.0',
+                version: '2.3.1',
                 name: 'EltonTV CineSrc - Fullscreen Remote',
                 description: 'Fullscreen CineSrc with Samsung TV remote controls'
             };
