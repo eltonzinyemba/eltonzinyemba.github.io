@@ -1,5 +1,5 @@
 /*
- * EltonTV / CineSrc for Lampa - 2.3.1 (Samsung TV remote edition)
+ * EltonTV / CineSrc for Lampa - 2.4.0 (Samsung TV remote edition)
  *
  * Full-viewport CineSrc iframe driven through CineSrc's postMessage API.
  * While the player is open every remote key is handled here and none reach
@@ -15,28 +15,34 @@
  *   Stop                  return to Lampa
  * The TV's own volume keys stay with the TV.
  *
- * Player menu: next / previous episode, episode list, subtitles, quality,
- * audio, speed, player volume, restart, CineSrc's own controls (pointer or
- * mouse), diagnostics.
+ * Player menu: next / previous episode, episode list, subtitles, speed,
+ * player volume, restart, CineSrc's own controls (mouse), diagnostics.
  *
  * Also: season/episode picker with "Continue", resume where you stopped,
  * next episode starts by itself after a countdown you can cancel.
  *
- * IMPORTANT: subtitles, quality, audio and speed need commands in CineSrc's
- * API whose names are not confirmed. See FEATURES below. Whatever the player
- * does not answer shows as "not available"; Diagnostics in the menu lists
- * what it did answer.
+ * WHAT CINESRC CAN BE TOLD (checked on a TV with Diagnostics):
+ *   play, pause, seek, setVolume, getPaused, getCurrentTime, getDuration,
+ *   getVolume, getMuted, getPlaybackRate. Nothing else: it has no commands
+ *   for subtitles, quality, audio tracks or servers. So:
+ *   - SUBTITLES are drawn by this plugin itself. It downloads subtitle files
+ *     for the title and shows each line at the position CineSrc reports.
+ *     They are independent of CineSrc's own subtitles, which this plugin
+ *     cannot switch on or off.
+ *   - QUALITY, AUDIO TRACK and SERVER can only be changed in CineSrc's own
+ *     controls, which need a mouse (menu: "CineSrc's own controls").
  */
 (function () {
     'use strict';
 
-    if (window.eltontv_cinesrc_remote_231) return;
-    window.eltontv_cinesrc_remote_231 = true;
+    if (window.eltontv_cinesrc_remote_240) return;
+    window.eltontv_cinesrc_remote_240 = true;
 
     var ORIGIN = 'https://cinesrc.st';
     var CONTROLLER = 'eltontv_cinesrc_remote';
     var EPISODE_KEY = 'eltontv_cinesrc_last_episode';
     var PROGRESS_KEY = 'eltontv_cinesrc_progress';
+    var SUBS_KEY = 'eltontv_cinesrc_subtitles';
 
     var SHOW_OSD = true;
     var OSD_MS = 2500;             // OSD stays this long after a key press
@@ -56,63 +62,56 @@
     var POINTER_FOCUS_MS = 5000;   // pointer mode: remote works again this long after a click
     var SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
 
-    // Optional player features. Their command names are NOT confirmed: they
-    // are the usual names for this style of API. Every variant is tried when
-    // the player loads; the first one that answers is used, and a feature
-    // nobody answers shows as "not available" in the menu.
-    // To correct a feature, edit its variants here. Nothing else changes.
-    //   list     command that returns an array of options
-    //   current  command that returns the active option (optional)
-    //   set      command that takes the chosen option
-    //   off      command that switches the feature off (optional; otherwise
-    //            set is sent with null)
-    var FEATURES = {
-        subtitles: {
-            title: 'Subtitles',
-            canTurnOff: true,
-            variants: [
-                { list: 'getTextTracks', set: 'enableTextTrack', off: 'disableTextTrack' },
-                { list: 'getSubtitles', current: 'getSubtitle', set: 'setSubtitle' },
-                { list: 'getCaptions', current: 'getCaption', set: 'setCaption' }
-            ]
-        },
-        quality: {
-            title: 'Quality',
-            variants: [
-                { list: 'getQualities', current: 'getQuality', set: 'setQuality' },
-                { list: 'getQualityLevels', current: 'getQualityLevel', set: 'setQualityLevel' }
-            ]
-        },
-        audio: {
-            title: 'Audio',
-            variants: [
-                { list: 'getAudioTracks', current: 'getAudioTrack', set: 'setAudioTrack' }
-            ]
-        },
-        speed: {
-            title: 'Speed',
-            values: SPEEDS,
-            variants: [
-                { current: 'getPlaybackRate', set: 'setPlaybackRate' },
-                { current: 'getSpeed', set: 'setSpeed' }
-            ]
-        }
-    };
-    var FEATURE_ORDER = ['subtitles', 'quality', 'audio', 'speed'];
+    /* ---- the plugin's own subtitles ---- */
+    var SUBTITLES = true;          // false removes the feature
+    // Source 1, no account needed: the OpenSubtitles add-on that Stremio
+    // publishes. It is asked by IMDb id, which Lampa's title data carries.
+    var STREMIO_SUBS = 'https://opensubtitles-v3.strem.io';
+    // Source 2, optional: Wyzie Subs. Needs a free key from
+    // https://sub.wyzie.io/redeem - paste it between the quotes to switch
+    // this source on. It is used when source 1 finds nothing.
+    var WYZIE_SUBS = 'https://sub.wyzie.io';
+    var WYZIE_KEY = '';
+    var SUB_SIZES = [['Small', 3.8], ['Normal', 4.8], ['Large', 6]]; // name, % of screen height
+    var SUB_DELAY_STEP = 0.25;     // seconds per Left/Right press on Timing
+    var SUB_VERSIONS = 10;         // files kept per language
+    var SUB_TICK_MS = 100;
+    var HTTP_TIMEOUT_MS = 12000;
 
-    // Diagnostics > "Try more command names" asks the player for each of
-    // these once. They only read state, so trying them changes nothing.
-    var EXTRA_PROBES = [
-        'getDuration', 'getMuted', 'getEnded', 'getBuffered', 'getState', 'getPlayerState',
-        'getInfo', 'getVideoInfo', 'getMeta', 'getMetadata',
-        'getSubtitle', 'getSubtitleTracks', 'getSubtitleTrack', 'getCurrentSubtitle',
-        'getSubtitleLanguage', 'getTextTrack', 'getCaption', 'getCaptionTracks', 'getTracks',
-        'getQuality', 'getCurrentQuality', 'getQualityLevel', 'getLevels', 'getLevel',
-        'getCurrentLevel', 'getVideoQuality', 'getResolution', 'getResolutions',
-        'getAudioTrack', 'getCurrentAudioTrack', 'getAudioLanguages', 'getLanguages', 'getLanguage',
-        'getSource', 'getSources', 'getCurrentSource', 'getServer', 'getServers',
-        'getCurrentServer', 'getProvider', 'getProviders',
-        'getEpisode', 'getSeason', 'getMethods', 'getCommands', 'getCapabilities'
+    // Name:codes. The codes are what the two sources use for a language.
+    var LANGUAGES = ('English:en,eng|Spanish:es,spa|Spanish (Latin America):ea,spl|Spanish (Spain):sp,spn|' +
+        'French:fr,fre,fra|German:de,ger,deu|Italian:it,ita|Portuguese:pt,por|' +
+        'Portuguese (Brazil):pb,pob,pt-br|Russian:ru,rus|Ukrainian:uk,ukr|Polish:pl,pol|Dutch:nl,dut,nld|' +
+        'Swedish:sv,swe|Danish:da,dan|Norwegian:no,nor,nb,nob|Finnish:fi,fin|Czech:cs,cze,ces|' +
+        'Slovak:sk,slo,slk|Hungarian:hu,hun|Romanian:ro,rum,ron|Bulgarian:bg,bul|Greek:el,gre,ell|' +
+        'Turkish:tr,tur|Arabic:ar,ara|Hebrew:he,heb|Persian:fa,per,fas|Hindi:hi,hin|Indonesian:id,ind|' +
+        'Malay:ms,may,msa|Vietnamese:vi,vie|Thai:th,tha|Korean:ko,kor|Japanese:ja,jpn|Chinese:zh,chi,zho|' +
+        'Chinese (Traditional):zt,zht,zh-tw|Chinese (bilingual):ze,zhe|Croatian:hr,hrv|Serbian:sr,scc,srp|' +
+        'Slovenian:sl,slv|Bosnian:bs,bos|Macedonian:mk,mac,mkd|Albanian:sq,alb,sqi|Estonian:et,est|' +
+        'Latvian:lv,lav|Lithuanian:lt,lit|Icelandic:is,ice,isl|Catalan:ca,cat|Basque:eu,baq,eus|' +
+        'Galician:gl,glg|Bengali:bn,ben|Tamil:ta,tam|Telugu:te,tel|Malayalam:ml,mal|Urdu:ur,urd|' +
+        'Georgian:ka,geo,kat|Armenian:hy,arm,hye|Azerbaijani:az,aze|Kazakh:kk,kaz|Sinhala:si,sin|' +
+        'Tagalog:tl,tgl|Burmese:my,bur,mya|Mongolian:mn,mon|Khmer:km,khm|Swahili:sw,swa|' +
+        'Afrikaans:af,afr|Montenegrin:me,mne|Belarusian:be,bel|Welsh:cy,wel,cym|Irish:ga,gle').split('|');
+
+    // Older subtitle files are not always UTF-8; this is the usual encoding
+    // for each language when a file is not.
+    var LEGACY_ENCODINGS = [
+        ['windows-1250', ['Polish', 'Czech', 'Slovak', 'Hungarian', 'Croatian', 'Slovenian', 'Romanian',
+            'Bosnian', 'Albanian', 'Montenegrin']],
+        ['windows-1251', ['Russian', 'Ukrainian', 'Bulgarian', 'Serbian', 'Macedonian', 'Belarusian',
+            'Kazakh', 'Mongolian']],
+        ['windows-1253', ['Greek']],
+        ['windows-1254', ['Turkish', 'Azerbaijani']],
+        ['windows-1255', ['Hebrew']],
+        ['windows-1256', ['Arabic', 'Persian', 'Urdu']],
+        ['windows-1257', ['Estonian', 'Latvian', 'Lithuanian']],
+        ['windows-1258', ['Vietnamese']],
+        ['windows-874', ['Thai']],
+        ['gb18030', ['Chinese', 'Chinese (bilingual)']],
+        ['big5', ['Chinese (Traditional)']],
+        ['shift_jis', ['Japanese']],
+        ['euc-kr', ['Korean']]
     ];
 
     var FLEX_ROW = 'display:-webkit-box;display:-webkit-flex;display:flex;' +
@@ -139,9 +138,11 @@
     var menuBox = null;
     var menuTitle = null;
     var menuList = null;
+    var subBox = null;
     var initialized = false;
     var swallowCode = 0;           // key that closed the player...
     var swallowUntil = 0;          // ...its repeats/key-up are hidden from Lampa
+    var languageByCode = null;
 
     // What is open (set by openPlayer).
     var media = null;
@@ -151,24 +152,37 @@
     var seasons = [];
     var returnController = 'content';
     var previousOverflow = '';
+    var lampaScreensaverWas = false;
     var pointerMode = false;       // iframe accepts the pointer
     var nativeControls = false;    // current page was loaded with CineSrc's own controls
     var menu = null;               // null, or a stack of menu levels
     var menuTimer = null;
     var focusTimer = null;
+    var subPrefs = { lang: '', size: 1, top: false, titles: {} };
 
     // Per page load of the iframe (reset by resetLoad).
-    var ready, paused, time, duration, volume;
+    var ready, paused, time, timeAt, duration, volume, speed, sourceId;
     var seekTarget, seekDelta, seekTimer, seekHoldUntil, pendingSeek;
     var pendingToggle, pendingVolume, inflight, osdTimer;
-    var resumeAt, finished, lastSaveAt, userPauseAt, countdown;
-    var feat, probeTimer, lastProbeAt, diag;
+    var resumeAt, finished, lastSaveAt, userPauseAt, countdown, diag;
+
+    // Subtitles for the current title or episode (reset by resetSubtitles).
+    var subStatus = '';            // '', 'loading', 'ready', 'none', 'error'
+    var subLangs = [];             // [{ name, files: [{ lang, url }] }]
+    var subLang = '';              // language being shown, '' = off
+    var subPick = 0;               // which file of that language
+    var subCues = [];
+    var subDelay = 0;              // seconds; positive = subtitles later
+    var subShown = '';
+    var subTimer = null;
+    var subToken = 0;              // invalidates late answers
+    var subFileToken = 0;
+    var subNotes = [];             // what each source said, for Diagnostics
 
     function clearLoadTimers() {
         var key;
         if (seekTimer) clearTimeout(seekTimer);
         if (osdTimer) clearTimeout(osdTimer);
-        if (probeTimer) clearTimeout(probeTimer);
         if (countdown && countdown.timer) clearInterval(countdown.timer);
         if (inflight) {
             for (key in inflight) {
@@ -178,13 +192,15 @@
     }
 
     function resetLoad() {
-        var i;
         clearLoadTimers();
         ready = false;
         paused = null;          // null = unknown
         time = null;
+        timeAt = 0;             // when `time` was last reported
         duration = null;
         volume = null;          // 0..1, null = unknown
+        speed = null;           // playback rate, null = unknown
+        sourceId = '';          // CineSrc's name for the server in use
         seekTarget = null;
         seekDelta = 0;
         seekTimer = null;
@@ -199,12 +215,6 @@
         lastSaveAt = 0;
         userPauseAt = 0;
         countdown = null;
-        probeTimer = null;
-        lastProbeAt = 0;
-        feat = {};
-        for (i = 0; i < FEATURE_ORDER.length; i++) {
-            feat[FEATURE_ORDER[i]] = { status: 'checking', variant: null, options: [], current: null };
-        }
         diag = { types: {}, last: {}, asked: {}, answered: {}, results: {}, foreign: '' };
     }
     resetLoad();
@@ -221,13 +231,6 @@
 
     function isArray(value) {
         return Object.prototype.toString.call(value) === '[object Array]';
-    }
-
-    function firstDefined() {
-        for (var i = 0; i < arguments.length; i++) {
-            if (arguments[i] !== undefined && arguments[i] !== null && arguments[i] !== '') return arguments[i];
-        }
-        return undefined;
     }
 
     // Short JSON of a message, without the fields named in `skip`.
@@ -309,6 +312,10 @@
         return duration && num(p) ? p / duration : 0;
     }
 
+    function speedLabel(value) {
+        return value === 1 ? 'Normal' : value + 'x';
+    }
+
     function makeUrl() {
         var id = encodeURIComponent(String(media.id));
         var url = ORIGIN + '/embed/';
@@ -330,7 +337,8 @@
     }
 
     function writeMap(key, map) {
-        try { Lampa.Storage.set(key, map); } catch (ignored) {}
+        // true = don't announce the change to the rest of Lampa
+        try { Lampa.Storage.set(key, map, true); } catch (ignored) {}
     }
 
     function loadLastEpisode(id) {
@@ -387,6 +395,7 @@
         if (duration && at > duration - RESUME_END_GAP) return;
         seekTarget = at;
         time = at;
+        timeAt = Date.now();
         seekHoldUntil = Date.now() + SEEK_HOLD_MS;
         send('seek', [at]);
         showPosition('Resumed');
@@ -579,8 +588,13 @@
 
     // get* requests: one in flight per command, abandoned after a timeout so
     // a missing reply can never leave a key dead for the rest of the session.
-    function request(command) {
-        if (inflight[command]) return;
+    // force = ask again even if an earlier ask is still waiting (used when
+    // the player says it is ready: anything sent before that was lost).
+    function request(command, force) {
+        if (inflight[command]) {
+            if (!force) return;
+            clearTimeout(inflight[command]);
+        }
         diag.asked[command] = true;
         inflight[command] = setTimeout(function () {
             inflight[command] = null;
@@ -605,6 +619,15 @@
         } else if (command === 'getVolume') {
             pendingVolume = 0;
         }
+    }
+
+    // Ask the player for whatever is still unknown.
+    function syncPlayer(force) {
+        if (!ready) return;
+        if (paused === null) request('getPaused', force);
+        if (volume === null) request('getVolume', force);
+        if (speed === null) request('getPlaybackRate', force);
+        if (!duration) request('getDuration', force);
     }
 
     /* ---------- playback ---------- */
@@ -665,6 +688,7 @@
         seekDelta = 0;
         if (seekTarget === null) return;
         time = seekTarget;
+        timeAt = Date.now();
         if (finished) {
             // Watching on after the end: "Continue" means this episode again.
             finished = false;
@@ -684,6 +708,7 @@
         finished = false;
         seekTarget = 0;
         time = 0;
+        timeAt = Date.now();
         seekHoldUntil = Date.now() + SEEK_HOLD_MS;
         send('seek', [0]);
         if (paused === true) play();
@@ -707,165 +732,434 @@
         }
     }
 
-    /* ---------- optional features: subtitles, quality, audio, speed ---------- */
-
-    function optionLabel(name, value) {
-        if (name === 'quality' && num(value)) return value + 'p';
-        if (name === 'speed') return value === 1 ? 'Normal' : value + 'x';
-        return String(value);
+    function setSpeed(value) {
+        if (!requireReady()) return;
+        send('setPlaybackRate', [value]);
+        speed = value;
+        osd('Speed', speedLabel(value), 0);
+        // Ask the player what it actually switched to.
+        setTimeout(function () {
+            if (overlay && ready) request('getPlaybackRate');
+        }, 800);
     }
 
-    // Accepts plain values or objects in the shapes players usually return.
-    function normalizeOptions(name, list) {
-        var options = [];
-        var active = null;
-        var i, entry, value, label;
-        for (i = 0; i < list.length; i++) {
-            entry = list[i];
-            if (entry === null || entry === undefined) continue;
-            if (typeof entry === 'object') {
-                value = firstDefined(entry.id, entry.value, entry.index, entry.language,
-                    entry.lang, entry.label, entry.name);
-                if (value === undefined) value = i;
-                label = firstDefined(entry.label, entry.name, entry.title, entry.language,
-                    entry.lang, num(entry.height) ? entry.height + 'p' : undefined);
-                if (label === undefined) label = optionLabel(name, value);
-                if (entry.mode === 'showing' || entry.active === true ||
-                    entry.selected === true || entry.current === true) {
-                    active = String(value);
+    /* ---------- the plugin's own subtitles: finding and loading ---------- */
+
+    function languageName(code) {
+        var key = String(code || '').toLowerCase();
+        var i, j, parts, codes;
+        if (!languageByCode) {
+            languageByCode = {};
+            for (i = 0; i < LANGUAGES.length; i++) {
+                parts = LANGUAGES[i].split(':');
+                codes = parts[1].split(',');
+                for (j = 0; j < codes.length; j++) languageByCode[codes[j]] = parts[0];
+                languageByCode[parts[0].toLowerCase()] = parts[0];
+            }
+        }
+        if (languageByCode[key]) return languageByCode[key];
+        if (key.indexOf('-') > 0 && languageByCode[key.split('-')[0]]) return languageByCode[key.split('-')[0]];
+        if (!key) return 'Unknown';
+        // Not a code we know: show it as given (a full name, or the code in capitals).
+        return key.length > 3 ? String(code) : key.toUpperCase();
+    }
+
+    function readSubPrefs() {
+        var stored = readMap(SUBS_KEY);
+        return {
+            lang: typeof stored.lang === 'string' ? stored.lang : '',
+            size: num(stored.size) && stored.size >= 0 && stored.size < SUB_SIZES.length ? stored.size : 1,
+            top: stored.top === true,
+            titles: stored.titles && typeof stored.titles === 'object' ? stored.titles : {}
+        };
+    }
+
+    function saveSubPrefs() {
+        writeMap(SUBS_KEY, subPrefs);
+    }
+
+    // Remember this title's file and timing, so they are back next time.
+    function rememberSubtitleChoice() {
+        subPrefs.titles[progressId()] = { l: subLang, p: subPick, d: subDelay, at: Date.now() };
+        prune(subPrefs.titles);
+        saveSubPrefs();
+    }
+
+    function subtitleNote(source, text) {
+        subNotes.push(source + ': ' + text);
+    }
+
+    // GET a web address. binary = hand back the raw bytes when the TV can
+    // decode them itself (needed for files that are not UTF-8).
+    function http(url, binary, done) {
+        var xhr;
+        var settled = false;
+        var raw = binary && typeof window.TextDecoder === 'function' && typeof window.Uint8Array === 'function';
+
+        function finish(body, note) {
+            if (settled) return;
+            settled = true;
+            done(body, note);
+        }
+
+        try {
+            xhr = new XMLHttpRequest();
+            xhr.open('GET', url, true);
+            if (raw) xhr.responseType = 'arraybuffer';
+            xhr.timeout = HTTP_TIMEOUT_MS;
+            xhr.onload = function () {
+                var message = '';
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    finish(raw ? xhr.response : xhr.responseText, 'ok');
+                    return;
                 }
-            } else {
-                value = entry;
-                label = optionLabel(name, value);
-            }
-            options.push({ id: String(value), value: value, label: String(label) });
+                if (!raw) {
+                    try { message = String(JSON.parse(xhr.responseText).message || ''); } catch (ignored) {}
+                }
+                finish(null, 'error ' + xhr.status + (message ? ' (' + message + ')' : ''));
+            };
+            xhr.onerror = function () { finish(null, 'could not connect'); };
+            xhr.ontimeout = function () { finish(null, 'timed out'); };
+            xhr.send();
+        } catch (e) {
+            finish(null, 'request failed');
         }
-        return { options: options, active: active };
     }
 
-    function toOptionId(name, f, result) {
-        var id, i;
-        if (result === null || result === undefined || result === false || result === '') return null;
-        if (typeof result === 'object') {
-            id = firstDefined(result.id, result.value, result.index, result.language,
-                result.lang, result.label, result.name);
-            if (id === undefined) return null;
-        } else {
-            id = result;
+    // Bytes to text: UTF-16 if marked, UTF-8 if valid, else the usual
+    // encoding for the language.
+    function decodeBytes(buffer, language) {
+        var bytes = new window.Uint8Array(buffer);
+        var name = 'windows-1252';
+        var i;
+        if (bytes[0] === 0xFF && bytes[1] === 0xFE) return new window.TextDecoder('utf-16le').decode(bytes);
+        if (bytes[0] === 0xFE && bytes[1] === 0xFF) return new window.TextDecoder('utf-16be').decode(bytes);
+        try {
+            return new window.TextDecoder('utf-8', { fatal: true }).decode(bytes);
+        } catch (notUtf8) {
+            for (i = 0; i < LEGACY_ENCODINGS.length; i++) {
+                if (LEGACY_ENCODINGS[i][1].indexOf(language) >= 0) name = LEGACY_ENCODINGS[i][0];
+            }
+            try { return new window.TextDecoder(name).decode(bytes); }
+            catch (unknownEncoding) { return new window.TextDecoder('utf-8').decode(bytes); }
         }
-        id = String(id);
-        for (i = 0; i < f.options.length; i++) {
-            if (f.options[i].id === id) return id;
-        }
-        // Not an id we know: it may be a position in the list.
-        if (num(result) && result % 1 === 0 && result >= 0 && result < f.options.length) {
-            return f.options[result].id;
-        }
-        return FEATURES[name].canTurnOff ? null : id;
     }
 
-    function findProbe(command) {
-        var i, j, name, variants;
-        for (i = 0; i < FEATURE_ORDER.length; i++) {
-            name = FEATURE_ORDER[i];
-            variants = FEATURES[name].variants;
-            for (j = 0; j < variants.length; j++) {
-                if (variants[j].list === command) return { name: name, variant: variants[j], kind: 'list' };
-                if (variants[j].current === command) return { name: name, variant: variants[j], kind: 'current' };
+    function findImdbId(done) {
+        var id = media.imdb_id || (media.external_ids && media.external_ids.imdb_id);
+        var url;
+        if (typeof id === 'string' && /^tt\d+$/.test(id)) {
+            done(id);
+            return;
+        }
+        // Not in the title data: ask TMDB the way Lampa does.
+        try {
+            url = Lampa.TMDB.api((series ? 'tv/' : 'movie/') + media.id + '/external_ids?api_key=' + Lampa.TMDB.key());
+        } catch (e) {
+            done(null);
+            return;
+        }
+        http(url, false, function (body) {
+            var data = null;
+            try { data = JSON.parse(body); } catch (ignored) {}
+            done(data && typeof data.imdb_id === 'string' && /^tt\d+$/.test(data.imdb_id) ? data.imdb_id : null);
+        });
+    }
+
+    // done(files, reached): reached = the source answered at all.
+    function fromStremio(imdb, done) {
+        var id = imdb + (series ? ':' + season + ':' + episode : '');
+        var url = STREMIO_SUBS + '/subtitles/' + (series ? 'series' : 'movie') + '/' +
+            encodeURIComponent(id) + '.json';
+        http(url, false, function (body, note) {
+            var files = [];
+            var data = null;
+            var list, i;
+            if (body !== null) {
+                try { data = JSON.parse(body); } catch (e) { note = 'answer not understood'; }
             }
+            list = data && isArray(data.subtitles) ? data.subtitles : [];
+            for (i = 0; i < list.length; i++) {
+                if (list[i] && typeof list[i].url === 'string') {
+                    files.push({ lang: languageName(list[i].lang), url: list[i].url });
+                }
+            }
+            subtitleNote('OpenSubtitles (Stremio)', data ? files.length + ' files' : note);
+            done(files, !!data);
+        });
+    }
+
+    function fromWyzie(done) {
+        var url = WYZIE_SUBS + '/search?id=' + encodeURIComponent(String(media.id)) +
+            (series ? '&season=' + season + '&episode=' + episode : '') +
+            '&key=' + encodeURIComponent(WYZIE_KEY);
+        http(url, false, function (body, note) {
+            var files = [];
+            var list = null;
+            var i, item, link;
+            if (body !== null) {
+                try { list = JSON.parse(body); } catch (e) { note = 'answer not understood'; }
+            }
+            // Wyzie reports "nothing found" as an error with this message.
+            if (body === null && /no subtitles|no matching/i.test(note)) list = [];
+            if (!isArray(list)) {
+                subtitleNote('Wyzie Subs', list ? 'answer not understood' : note);
+                done([], false);
+                return;
+            }
+            for (i = 0; i < list.length; i++) {
+                item = list[i];
+                if (!item || typeof item.url !== 'string') continue;
+                // Ask Wyzie to hand every file over as SRT.
+                link = item.url + (item.url.indexOf('?') < 0 ? '?' : '&') + 'to=srt';
+                files.push({ lang: languageName(item.language || item.display), url: link });
+            }
+            subtitleNote('Wyzie Subs', files.length + ' files');
+            done(files, true);
+        });
+    }
+
+    function findSubtitleGroup(name) {
+        for (var i = 0; i < subLangs.length; i++) {
+            if (subLangs[i].name === name) return subLangs[i];
         }
         return null;
     }
 
-    function probeFeatures(force) {
-        var i, j, f, variants;
-        if (!ready) return;
-        if (!force && Date.now() - lastProbeAt < 3000) return;
-        lastProbeAt = Date.now();
-
-        for (i = 0; i < FEATURE_ORDER.length; i++) {
-            f = feat[FEATURE_ORDER[i]];
-            if (f.status === 'ready') {
-                // Known feature: refresh it (subtitle lists often arrive late).
-                if (f.variant.list) request(f.variant.list);
-                if (f.variant.current) request(f.variant.current);
-            } else {
-                variants = FEATURES[FEATURE_ORDER[i]].variants;
-                for (j = 0; j < variants.length; j++) {
-                    request(variants[j].list || variants[j].current);
-                }
-            }
-        }
-
-        if (probeTimer) clearTimeout(probeTimer);
-        probeTimer = setTimeout(function () {
-            probeTimer = null;
-            for (var k = 0; k < FEATURE_ORDER.length; k++) {
-                if (feat[FEATURE_ORDER[k]].status === 'checking') feat[FEATURE_ORDER[k]].status = 'none';
-            }
-            refreshMenu();
-        }, REQUEST_TIMEOUT_MS + 300);
-    }
-
-    function onFeatureResponse(hit, data) {
-        var spec = FEATURES[hit.name];
-        var f = feat[hit.name];
-        var result = data.result;
-        var parsed;
-        if (data.error) return;
-        if (f.status === 'ready' && f.variant !== hit.variant) return;
-
-        if (hit.kind === 'list') {
-            if (!isArray(result)) return;
-            parsed = normalizeOptions(hit.name, result);
-            f.options = parsed.options;
-            if (f.status !== 'ready') {
-                f.status = 'ready';
-                f.variant = hit.variant;
-                if (hit.variant.current) request(hit.variant.current);
-            }
-            if (!hit.variant.current) f.current = parsed.active;
-            else if (f.current === null && parsed.active !== null) f.current = parsed.active;
-        } else if (spec.values) {
-            if (!num(result)) return;
-            if (f.status !== 'ready') {
-                f.status = 'ready';
-                f.variant = hit.variant;
-                f.options = normalizeOptions(hit.name, spec.values).options;
-            }
-            f.current = toOptionId(hit.name, f, result);
-        } else {
-            if (f.status !== 'ready') return;
-            f.current = toOptionId(hit.name, f, result);
-        }
+    // Look for subtitle files for the current title or episode.
+    function loadSubtitleList() {
+        var token = ++subToken;
+        var reachedAny = false;
+        subStatus = 'loading';
+        subNotes = [];
         refreshMenu();
+
+        function finish(files) {
+            var byName = {};
+            var names = [];
+            var i, name;
+            if (token !== subToken || !overlay) return;
+            for (i = 0; i < files.length; i++) {
+                name = files[i].lang;
+                if (!byName[name]) {
+                    byName[name] = [];
+                    names.push(name);
+                }
+                if (byName[name].length < SUB_VERSIONS) byName[name].push(files[i]);
+            }
+            names.sort();
+            subLangs = [];
+            for (i = 0; i < names.length; i++) subLangs.push({ name: names[i], files: byName[names[i]] });
+            subStatus = subLangs.length ? 'ready' : (reachedAny ? 'none' : 'error');
+            // Bring back the language chosen last time, if this title has it.
+            if (subPrefs.lang && !subLang && findSubtitleGroup(subPrefs.lang)) useSubtitleLanguage(subPrefs.lang);
+            refreshMenu();
+        }
+
+        function wyzie() {
+            if (!WYZIE_KEY) {
+                finish([]);
+                return;
+            }
+            fromWyzie(function (files, reached) {
+                reachedAny = reachedAny || reached;
+                finish(files);
+            });
+        }
+
+        findImdbId(function (imdb) {
+            if (token !== subToken || !overlay) return;
+            if (!imdb) {
+                subtitleNote('OpenSubtitles (Stremio)', 'skipped, this title has no IMDb id');
+                wyzie();
+                return;
+            }
+            fromStremio(imdb, function (files, reached) {
+                reachedAny = reachedAny || reached;
+                if (files.length) finish(files);
+                else wyzie();
+            });
+        });
     }
 
-    function currentLabel(name) {
-        var f = feat[name];
-        for (var i = 0; i < f.options.length; i++) {
-            if (f.options[i].id === f.current) return f.options[i].label;
-        }
-        if (f.current !== null) return optionLabel(name, f.current);
-        return FEATURES[name].canTurnOff ? 'Off' : '';
+    /* ---------- the plugin's own subtitles: reading and drawing ---------- */
+
+    function parseTimestamp(text) {
+        var match = /(?:(\d+):)?(\d{1,2}):(\d{1,2})[.,](\d{1,3})/.exec(text);
+        if (!match) return null;
+        return Number(match[1] || 0) * 3600 + Number(match[2]) * 60 + Number(match[3]) +
+            Number((match[4] + '00').slice(0, 3)) / 1000;
     }
 
-    function chooseOption(name, option) {
-        var spec = FEATURES[name];
-        var f = feat[name];
-        if (f.status !== 'ready') return;
-        if (option) send(f.variant.set, [option.value]);
-        else if (f.variant.off) send(f.variant.off);
-        else send(f.variant.set, [null]);
-        f.current = option ? option.id : null;
-        osd(spec.title, option ? option.label : 'Off', 0);
-        popLevel();
-        if (f.variant.current) {
-            // Ask the player what it actually switched to.
-            setTimeout(function () {
-                if (overlay && feat[name] === f) request(f.variant.current);
-            }, 800);
+    // SRT and WebVTT. Tags are dropped: lines are drawn as plain text.
+    function parseSubtitles(text) {
+        var cues = [];
+        var blocks = String(text).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').split(/\n[ \t]*\n/);
+        var i, j, lines, times, start, end, body;
+        for (i = 0; i < blocks.length; i++) {
+            lines = blocks[i].split('\n');
+            for (j = 0; j < lines.length; j++) {
+                if (lines[j].indexOf('-->') >= 0) break;
+            }
+            if (j === lines.length) continue;
+            times = lines[j].split('-->');
+            start = parseTimestamp(times[0]);
+            end = parseTimestamp(times[1]);
+            if (start === null || end === null) continue;
+            body = lines.slice(j + 1).join('\n')
+                .replace(/<[^>]*>/g, '')
+                .replace(/\{\\[^}]*\}/g, '')
+                .replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
+                .replace(/^\s+|\s+$/g, '');
+            if (body) cues.push({ start: start, end: end, text: body });
         }
+        cues.sort(function (a, b) { return a.start - b.start; });
+        return cues;
+    }
+
+    // The text that belongs on screen at second t.
+    function cueTextAt(t) {
+        var low = 0;
+        var high = subCues.length - 1;
+        var out = [];
+        var middle, i;
+        while (low <= high) {
+            middle = (low + high) >> 1;
+            if (subCues[middle].start <= t) low = middle + 1;
+            else high = middle - 1;
+        }
+        // `high` is the last line that has started; a few may overlap.
+        for (i = Math.max(0, high - 4); i <= high; i++) {
+            if (subCues[i].end > t) out.push(subCues[i].text);
+        }
+        return out.join('\n');
+    }
+
+    // CineSrc reports the position about four times a second; between
+    // reports the clock is carried forward so lines appear on time.
+    function subtitleTime() {
+        var base = position();
+        if (!num(base)) return null;
+        if (paused !== true && !seekBusy() && timeAt) {
+            base += Math.min(1.5, (Date.now() - timeAt) / 1000) * (speed || 1);
+        }
+        return base;
+    }
+
+    function drawSubtitles() {
+        var t, text;
+        if (!subBox) return;
+        t = subCues.length ? subtitleTime() : null;
+        text = t === null ? '' : cueTextAt(t - subDelay);
+        if (text === subShown) return;
+        subShown = text;
+        subBox.textContent = text;
+    }
+
+    function styleSubtitles() {
+        if (!subBox) return;
+        subBox.style.fontSize = SUB_SIZES[subPrefs.size][1] + 'vh';
+        subBox.style.top = subPrefs.top ? '6vh' : 'auto';
+        subBox.style.bottom = subPrefs.top ? 'auto' : '10vh';
+    }
+
+    function buildSubtitleBox() {
+        subBox = document.createElement('div');
+        subBox.className = 'eltontv-subs';
+        subBox.style.cssText = 'position:absolute;left:8%;right:8%;text-align:center;pointer-events:none;' +
+            'color:#fff;font-family:sans-serif;font-weight:600;line-height:1.3;white-space:pre-line;' +
+            'text-shadow:0 0 0.5vh #000,0 0 0.5vh #000,0.15vh 0.15vh 0.2vh #000,-0.15vh -0.15vh 0.2vh #000;';
+        overlay.appendChild(subBox);
+        styleSubtitles();
+    }
+
+    function stopSubtitleFile() {
+        subFileToken++;
+        if (subTimer) clearInterval(subTimer);
+        subTimer = null;
+        subCues = [];
+        subShown = '';
+        if (subBox) subBox.textContent = '';
+    }
+
+    function resetSubtitles() {
+        subToken++;
+        stopSubtitleFile();
+        subStatus = '';
+        subLangs = [];
+        subLang = '';
+        subPick = 0;
+        subDelay = 0;
+        subNotes = [];
+    }
+
+    function loadSubtitleFile() {
+        var group = findSubtitleGroup(subLang);
+        var token, file, count;
+        stopSubtitleFile();
+        if (!group) {
+            refreshMenu();
+            return;
+        }
+        count = group.files.length;
+        if (subPick < 0 || subPick >= count) subPick = 0;
+        file = group.files[subPick];
+        token = subFileToken;
+        osd('Subtitles', subLang + (count > 1 ? ' ' + (subPick + 1) + '/' + count : ''), 0);
+        refreshMenu();
+
+        http(file.url, true, function (body, note) {
+            var text, cues;
+            if (token !== subFileToken || !overlay) return;
+            text = body === null ? '' : (typeof body === 'string' ? body : decodeBytes(body, subLang));
+            cues = text ? parseSubtitles(text) : [];
+            if (!cues.length) {
+                subtitleNote(subLang + ' file ' + (subPick + 1), body === null ? note : 'not a subtitle file this plugin can read');
+                osd('Subtitles', count > 1 ? 'this version failed, try another' : 'could not be loaded', 0);
+                refreshMenu();
+                return;
+            }
+            subCues = cues;
+            subTimer = setInterval(drawSubtitles, SUB_TICK_MS);
+            drawSubtitles();
+            refreshMenu();
+        });
+    }
+
+    // name = '' switches the plugin's subtitles off.
+    function useSubtitleLanguage(name) {
+        var memory = subPrefs.titles[progressId()];
+        subLang = name;
+        subPrefs.lang = name;
+        saveSubPrefs();
+        if (!name) {
+            stopSubtitleFile();
+            osd('Subtitles', 'Off', 0);
+            refreshMenu();
+            return;
+        }
+        // Same title and language as before: same file and timing as before.
+        if (memory && memory.l === name) {
+            subPick = num(memory.p) ? memory.p : 0;
+            subDelay = num(memory.d) ? memory.d : 0;
+        } else {
+            subPick = 0;
+            subDelay = 0;
+        }
+        loadSubtitleFile();
+    }
+
+    function subtitleSummary() {
+        if (subStatus === 'loading') return 'searching';
+        if (subLang) return subLang;
+        if (subPrefs.lang && subStatus === 'error') return 'unavailable';
+        if (subPrefs.lang && (subStatus === 'none' || subStatus === 'ready')) return 'no ' + subPrefs.lang;
+        return 'Off';
+    }
+
+    function timingLabel() {
+        if (!subDelay) return 'in sync';
+        return Math.abs(subDelay).toFixed(2) + ' s ' + (subDelay > 0 ? 'later' : 'earlier');
     }
 
     /* ---------- player menu ---------- */
@@ -1026,45 +1320,113 @@
         return true;
     }
 
-    function featureRow(name) {
-        var spec = FEATURES[name];
-        var f = feat[name];
-        if (f.status !== 'ready') {
-            return {
-                label: spec.title,
-                value: f.status === 'checking' ? 'checking' : 'not available',
-                disabled: true
-            };
-        }
-        if (!f.options.length) return { label: spec.title, value: 'none found', disabled: true };
+    function speedItem(value) {
         return {
-            label: spec.title,
-            value: currentLabel(name),
+            label: speedLabel(value),
+            current: speed === value,
             action: function () {
-                pushLevel(spec.title, function () { return buildOptions(name); });
+                setSpeed(value);
+                popLevel();
             }
         };
     }
 
-    function optionItem(name, option) {
+    function buildSpeeds() {
+        var items = [];
+        for (var i = 0; i < SPEEDS.length; i++) items.push(speedItem(SPEEDS[i]));
+        return items;
+    }
+
+    function subtitleLanguageItem(group) {
         return {
-            label: option ? option.label : 'Off',
-            current: feat[name].current === (option ? option.id : null),
-            action: function () { chooseOption(name, option); }
+            label: group.name,
+            value: group.files.length > 1 ? group.files.length + ' versions' : '',
+            current: subLang === group.name,
+            action: function () {
+                useSubtitleLanguage(group.name);
+                popLevel();
+            }
         };
     }
 
-    function buildOptions(name) {
-        var f = feat[name];
-        var items = [];
-        var hasOff = false;
+    function buildSubtitleLanguages() {
+        var items = [{
+            label: 'Off',
+            current: !subLang,
+            action: function () {
+                useSubtitleLanguage('');
+                popLevel();
+            }
+        }];
         var i;
-        for (i = 0; i < f.options.length; i++) {
-            if (/^(off|none|disabled)$/i.test(f.options[i].label)) hasOff = true;
+        if (subStatus === 'loading') {
+            items.push({ label: 'Searching for subtitles', disabled: true });
+        } else if (subStatus === 'error') {
+            items.push({ label: 'The subtitle source could not be reached', disabled: true });
+            items.push({ label: 'Try again', action: loadSubtitleList });
+        } else if (subStatus === 'none') {
+            items.push({ label: 'None found for this title', disabled: true });
         }
-        if (FEATURES[name].canTurnOff && !hasOff) items.push(optionItem(name, null));
-        for (i = 0; i < f.options.length; i++) items.push(optionItem(name, f.options[i]));
+        for (i = 0; i < subLangs.length; i++) items.push(subtitleLanguageItem(subLangs[i]));
         return items;
+    }
+
+    function buildSubtitleMenu() {
+        var group = findSubtitleGroup(subLang);
+        var count = group ? group.files.length : 0;
+        var active = !!group;
+        return [
+            {
+                label: 'Language',
+                value: subtitleSummary(),
+                action: function () {
+                    if (!subStatus) loadSubtitleList();
+                    pushLevel('Subtitle language', buildSubtitleLanguages);
+                }
+            },
+            {
+                label: 'Version',
+                value: active ? '< ' + (subPick + 1) + ' of ' + count + ' >' : '',
+                disabled: count < 2,
+                adjust: function (direction) {
+                    subPick = (subPick + direction + count) % count;
+                    subDelay = 0;
+                    rememberSubtitleChoice();
+                    loadSubtitleFile();
+                }
+            },
+            {
+                label: 'Timing',
+                value: active ? '< ' + timingLabel() + ' >' : '',
+                disabled: !active,
+                adjust: function (direction) {
+                    subDelay = Math.round((subDelay + direction * SUB_DELAY_STEP) * 100) / 100;
+                    rememberSubtitleChoice();
+                    drawSubtitles();
+                    refreshMenu();
+                }
+            },
+            {
+                label: 'Size',
+                value: '< ' + SUB_SIZES[subPrefs.size][0] + ' >',
+                adjust: function (direction) {
+                    subPrefs.size = Math.max(0, Math.min(SUB_SIZES.length - 1, subPrefs.size + direction));
+                    saveSubPrefs();
+                    styleSubtitles();
+                    refreshMenu();
+                }
+            },
+            {
+                label: 'Position',
+                value: '< ' + (subPrefs.top ? 'Top' : 'Bottom') + ' >',
+                adjust: function () {
+                    subPrefs.top = !subPrefs.top;
+                    saveSubPrefs();
+                    styleSubtitles();
+                    refreshMenu();
+                }
+            }
+        ];
     }
 
     function episodeItem(s, e) {
@@ -1112,7 +1474,7 @@
 
     function buildRoot() {
         var items = [];
-        var next, prev, i;
+        var next, prev;
         if (series) {
             next = neighbour(1);
             prev = neighbour(-1);
@@ -1141,7 +1503,18 @@
                 action: function () { openEpisodes(season); }
             });
         }
-        for (i = 0; i < FEATURE_ORDER.length; i++) items.push(featureRow(FEATURE_ORDER[i]));
+        if (SUBTITLES) {
+            items.push({
+                label: 'Subtitles',
+                value: subtitleSummary(),
+                action: function () { pushLevel('Subtitles', buildSubtitleMenu); }
+            });
+        }
+        items.push({
+            label: 'Speed',
+            value: speed === null ? '' : speedLabel(speed),
+            action: function () { pushLevel('Speed', buildSpeeds); }
+        });
         items.push({
             label: 'Player volume',
             value: volume === null ? '< >' : '< ' + Math.round(volume * 100) + '% >',
@@ -1172,12 +1545,6 @@
             else silent.push(key);
         }
         items.push({
-            label: 'Try more command names',
-            value: ready ? EXTRA_PROBES.length + ' names' : 'player not ready',
-            disabled: !ready,
-            action: tryMoreCommands
-        });
-        items.push({
             label: 'Message details',
             action: function () { pushLevel('Message details', buildDetails); }
         });
@@ -1187,9 +1554,11 @@
             stacked: true
         });
         items.push({ label: 'Commands it answered', value: answered.join(', ') || 'none', stacked: true });
+        items.push({ label: 'Commands it ignored', value: silent.join(', ') || 'none', stacked: true });
+        items.push({ label: 'CineSrc server in use', value: sourceId || 'not reported', stacked: true });
         items.push({
-            label: 'Commands it ignored',
-            value: silent.length > 10 ? silent.length + ' of the names tried' : silent.join(', ') || 'none',
+            label: 'Subtitle sources',
+            value: subNotes.length ? subNotes.join('; ') : (subStatus === 'loading' ? 'searching' : 'not asked yet'),
             stacked: true
         });
         items.push({ label: 'Expected player address', value: ORIGIN, stacked: true });
@@ -1203,13 +1572,6 @@
             stacked: true
         });
         return items;
-    }
-
-    function tryMoreCommands() {
-        if (!ready) return;
-        for (var i = 0; i < EXTRA_PROBES.length; i++) request(EXTRA_PROBES[i]);
-        osd('Asking the player', EXTRA_PROBES.length + ' names', 0);
-        refreshMenu();
     }
 
     // What each answer and each kind of message actually contained. The
@@ -1244,23 +1606,16 @@
 
     /* ---------- messages from CineSrc ---------- */
 
-    function syncPlayer(force) {
-        if (!ready) return;
-        if (paused === null) request('getPaused');
-        if (volume === null) request('getVolume');
-        probeFeatures(force);
-    }
-
     function onResponse(data) {
         var result = data.result;
         var command = data.command;
-        var queued, hit;
+        var queued;
         if (typeof command !== 'string') return;
         diag.answered[command] = true;
         diag.results[command] = compact(data, ['type', 'command']);
+        settle(command);
 
         if (command === 'getPaused') {
-            settle('getPaused');
             if (typeof result === 'boolean') paused = result;
             if (pendingToggle) {
                 pendingToggle = false;
@@ -1268,13 +1623,14 @@
                 else play();
             }
         } else if (command === 'getCurrentTime') {
-            settle('getCurrentTime');
-            if (num(result) && !seekBusy()) time = result;
+            if (num(result) && !seekBusy()) {
+                time = result;
+                timeAt = Date.now();
+            }
             queued = pendingSeek;
             pendingSeek = 0;
             if (queued && time !== null) seekBy(queued);
         } else if (command === 'getVolume') {
-            settle('getVolume');
             queued = pendingVolume;
             pendingVolume = 0;
             if (num(result)) {
@@ -1282,11 +1638,13 @@
                 if (queued) setVolume(volume + queued);
                 else refreshMenu();
             }
-        } else {
-            settle(command);
-            hit = findProbe(command);
-            if (hit) onFeatureResponse(hit, data);
-            else refreshMenu();
+        } else if (command === 'getPlaybackRate') {
+            if (num(result) && result > 0) {
+                speed = result;
+                refreshMenu();
+            }
+        } else if (command === 'getDuration') {
+            if (num(result) && result > 0 && !duration) duration = result;
         }
     }
 
@@ -1305,16 +1663,20 @@
         diag.types[type] = (diag.types[type] || 0) + 1;
         if (type !== 'cinesrc:response') diag.last[type] = compact(data, ['type']);
         if (!ready) {
-            ready = true; // any message from the player means it is listening
-            syncPlayer(true);
+            ready = true; // any message from the player means it is loading
+            if (type !== 'cinesrc:ready') syncPlayer(false);
         }
 
         switch (type) {
             case 'cinesrc:ready':
-                syncPlayer(true);
+                syncPlayer(true); // anything asked before this was lost
+                break;
+            case 'cinesrc:sourceused':
+                if (typeof data.sourceId === 'string') sourceId = data.sourceId;
                 break;
             case 'cinesrc:play':
                 paused = false;
+                timeAt = Date.now();
                 setTvScreensaver(false);
                 if (!osdTimer) settleOsd();
                 break;
@@ -1333,7 +1695,7 @@
                 onEnded();
                 break;
             case 'cinesrc:loadedmetadata':
-                if (num(data.duration)) duration = data.duration;
+                if (num(data.duration) && data.duration > 0) duration = data.duration;
                 break;
             case 'cinesrc:volumechange':
                 if (num(data.volume)) {
@@ -1348,9 +1710,10 @@
                 }
                 /* falls through */
             case 'cinesrc:timeupdate':
-                if (num(data.duration)) duration = data.duration;
+                if (num(data.duration) && data.duration > 0) duration = data.duration;
                 if (num(data.currentTime) && !seekBusy()) {
                     time = data.currentTime;
+                    timeAt = Date.now();
                     seekTarget = null;
                     if (duration && time >= duration - 0.3) onEnded();
                     else if (paused !== true) tickSave();
@@ -1386,7 +1749,10 @@
         closePlayer();
     }
 
-    // Registered once, in the capture phase, so it runs before Lampa's keypad.
+    // Registered once, in the capture phase. Lampa's keypad listens on the
+    // same window without capture, so this always runs first and can keep a
+    // key from it. That matters for OK in particular: Lampa acts on OK when
+    // the key is released and would press whatever card button has focus.
     function onKeyDown(event) {
         var code = event.keyCode || event.which;
 
@@ -1479,6 +1845,8 @@
         }
     }
 
+    // Lampa registers the media and channel keys itself on Samsung TVs; the
+    // two track keys are the only ones it leaves out.
     function registerRemoteKeys() {
         try {
             if (window.tizen && tizen.tvinputdevice && tizen.tvinputdevice.registerKey) {
@@ -1495,7 +1863,7 @@
         }
     }
 
-    /* ---------- focus, pointer mode, screensaver, backgrounding ---------- */
+    /* ---------- focus, pointer mode, screensavers, backgrounding ---------- */
 
     function focusOverlay() {
         if (!overlay) return;
@@ -1514,9 +1882,10 @@
         }, pointerMode ? POINTER_FOCUS_MS : 0);
     }
 
-    // Pointer mode lets a pointer or mouse use CineSrc's own controls, which
-    // is the only way to reach anything its API does not offer (servers, for
-    // one). The remote keeps working whenever focus is back with the plugin.
+    // Pointer mode lets a mouse use CineSrc's own controls, which is the only
+    // way to reach what its API does not offer: quality, audio track, server
+    // and its own subtitles. The remote keeps working whenever focus is back
+    // with the plugin.
     function setPointerMode(on) {
         if (!overlay || on === pointerMode) return;
         pointerMode = on;
@@ -1527,7 +1896,7 @@
                 saveProgress();
                 load(); // reload once with CineSrc's controls visible
             }
-            osd('Pointer mode', '', 0, 'Point at the video to use CineSrc\'s controls. Back returns to the remote.');
+            osd('Mouse mode', '', 0, 'Click in the video to use CineSrc\'s controls. Back returns to the remote.');
         } else {
             focusOverlay();
             osd('Remote control', '', 0);
@@ -1546,6 +1915,25 @@
         } catch (ignored) {}
     }
 
+    // Lampa's screensaver restarts its countdown on key presses, and this
+    // player keeps all keys to itself, so Lampa would start its slideshow
+    // behind the video. Switch it off while the player is open.
+    function pauseLampaScreensaver() {
+        try {
+            lampaScreensaverWas = !!(Lampa.Screensaver && Lampa.Screensaver.enabled);
+            if (lampaScreensaverWas) Lampa.Screensaver.disable();
+        } catch (ignored) {
+            lampaScreensaverWas = false;
+        }
+    }
+
+    function resumeLampaScreensaver() {
+        try {
+            if (lampaScreensaverWas) Lampa.Screensaver.enable();
+        } catch (ignored) {}
+        lampaScreensaverWas = false;
+    }
+
     function onVisibilityChange() {
         if (document.hidden && overlay && ready && paused !== true) pause();
     }
@@ -1556,6 +1944,7 @@
     function load() {
         var saved;
         resetLoad();
+        resetSubtitles();
         nativeControls = pointerMode;
         if (RESUME) {
             saved = readMap(PROGRESS_KEY)[progressId()];
@@ -1565,6 +1954,8 @@
         }
         iframe.src = makeUrl();
         osd(series ? episodeLabel({ s: season, e: episode }) : 'Loading', series ? 'Loading' : '', 0);
+        // A language chosen earlier comes back by itself.
+        if (SUBTITLES && subPrefs.lang) loadSubtitleList();
         refreshMenu();
     }
 
@@ -1575,6 +1966,7 @@
         var oldOverlay = overlay;
         var oldFrame = iframe;
         clearLoadTimers();
+        resetSubtitles();
         if (menuTimer) clearTimeout(menuTimer);
         if (focusTimer) clearTimeout(focusTimer);
         menuTimer = null;
@@ -1585,6 +1977,7 @@
         iframe = null;
         osdBox = osdLabel = osdValue = osdBar = osdHint = null;
         menuBox = menuTitle = menuList = null;
+        subBox = null;
         media = null;
         pointerMode = false;
         nativeControls = false;
@@ -1594,6 +1987,7 @@
         document.removeEventListener('focus', reclaimFocus, true);
         document.removeEventListener('visibilitychange', onVisibilityChange, false);
         setTvScreensaver(true);
+        resumeLampaScreensaver();
 
         if (oldFrame) {
             try { oldFrame.src = 'about:blank'; } catch (ignored) {}
@@ -1622,6 +2016,7 @@
         pointerMode = false;
         nativeControls = false;
         menu = null;
+        subPrefs = readSubPrefs();
         returnController = returnTo || activeControllerName();
         previousOverflow = document.body.style.overflow;
         if (series) saveLastEpisode(movie.id, season, episode);
@@ -1645,6 +2040,7 @@
             'margin:0;padding:0;background:#000;pointer-events:none;';
         iframe.addEventListener('load', reclaimFocus, false);
         overlay.appendChild(iframe);
+        if (SUBTITLES) buildSubtitleBox();
         if (SHOW_OSD) buildOsd();
         buildMenu();
         document.body.appendChild(overlay);
@@ -1655,6 +2051,7 @@
         document.addEventListener('focus', reclaimFocus, true);
         document.addEventListener('visibilitychange', onVisibilityChange, false);
         registerRemoteKeys();
+        pauseLampaScreensaver();
 
         // Lampa's controller only has to know the player owns the screen.
         // Keys are handled by onKeyDown; a back from elsewhere just closes.
@@ -1784,7 +2181,7 @@
         if (Lampa.Manifest) {
             Lampa.Manifest.plugins = {
                 type: 'video',
-                version: '2.3.1',
+                version: '2.4.0',
                 name: 'EltonTV CineSrc - Fullscreen Remote',
                 description: 'Fullscreen CineSrc with Samsung TV remote controls'
             };
