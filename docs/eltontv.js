@@ -1,52 +1,44 @@
 /*
- * EltonTV 2.5.0 - Samsung remote + mouse + provider adapters
- * Replace the whole old plugin, then fully restart Lampa. Do not run both.
- * CineSrc stays the default. FrameXTV/Archer is an experimental API adapter.
- * Chillflix is an explicitly mouse-only fallback: no invented playback API.
- * 2160p is a preference, never proof of the delivered resolution.
- * Direct MP4/HLS uses a video element, with no provider iframe.
- * Cross-origin iframe keys cannot bubble into the parent. In web-controls
- * mode click the persistent Return to remote button to regain parent keys.
- * API references and setup instructions are in EltonTV_v2.5_README.md.
+ * EltonTV / CineSrc for Lampa - 2.4.0 (Samsung TV remote edition)
+ *
+ * Full-viewport CineSrc iframe driven through CineSrc's postMessage API.
+ * While the player is open every remote key is handled here and none reach
+ * Lampa, so no action can fire twice.
+ *
+ * Remote:
+ *   OK / Play-Pause       toggle playback
+ *   Play, Pause           play, pause
+ *   Left/Right, Rew/FF    -/+10 s (quick presses add up into one seek)
+ *   Up / Down             open the player menu
+ *   CH+ / CH-             next / previous episode
+ *   Back                  close the menu, then return to Lampa
+ *   Stop                  return to Lampa
+ * The TV's own volume keys stay with the TV.
+ *
+ * Player menu: next / previous episode, episode list, subtitles, speed,
+ * player volume, restart, CineSrc's own controls (mouse), diagnostics.
+ *
+ * Also: season/episode picker with "Continue", resume where you stopped,
+ * next episode starts by itself after a countdown you can cancel.
+ *
+ * WHAT CINESRC CAN BE TOLD (checked on a TV with Diagnostics):
+ *   play, pause, seek, setVolume, getPaused, getCurrentTime, getDuration,
+ *   getVolume, getMuted, getPlaybackRate. Nothing else: it has no commands
+ *   for subtitles, quality, audio tracks or servers. So:
+ *   - SUBTITLES are drawn by this plugin itself. It downloads subtitle files
+ *     for the title and shows each line at the position CineSrc reports.
+ *     They are independent of CineSrc's own subtitles, which this plugin
+ *     cannot switch on or off.
+ *   - QUALITY, AUDIO TRACK and SERVER can only be changed in CineSrc's own
+ *     controls, which need a mouse (menu: "CineSrc's own controls").
  */
 (function () {
     'use strict';
 
-    if (window.eltontv_cinesrc_remote_250) return;
-    window.eltontv_cinesrc_remote_250 = true;
+    if (window.eltontv_cinesrc_remote_240) return;
+    window.eltontv_cinesrc_remote_240 = true;
 
-    // Optional: define window.EltonTVConfig before this plugin, or edit here.
-    // resolver: HTTPS URL returning {sources:[{url,type,height,label}]}.
-    // No scraping, token extraction or backend is included.
-    var CONFIG = window.EltonTVConfig || {};
-    var DIRECT_RESOLVER = CONFIG.resolver || '';
-    var PROVIDERS = [
-        { id: 'cinesrc', name: 'CineSrc', origin: 'https://cinesrc.st',
-          control: true, getters: true, rate: true,
-          detail: 'Default; requests 2160p where available' },
-        { id: 'framextv', name: 'FrameXTV / Archer', origin: 'https://framextv.xyz',
-          control: true, getters: false, rate: false,
-          detail: 'Experimental; 4K-capable Archer; play/pause/seek/volume API' },
-        { id: 'chillflix', name: 'Chillflix (mouse only)', origin: 'https://www.chillflix.pw',
-          control: false, getters: false, rate: false,
-          detail: 'Prefer 4K; playback controls are inside its web player' },
-        { id: 'direct', name: 'Direct MP4 / HLS', origin: '',
-          control: true, getters: true, rate: true,
-          detail: 'No iframe; paste a stream URL or configure a resolver' }
-    ];
-    var provider = PROVIDERS[0];
-    var ORIGIN = provider.origin;
-    var qualityPreference = '2160';
-    var video = null, hls = null, surface = null, clickShield = null;
-    var toolbar = null, rescue = null, toolbarTime = null, toolbarSeek = null;
-    var toolbarPlay = null, toolbarTimer = null, monitorTimer = null, loadTimer = null;
-    var speedTimer = null, loadGeneration = 0, hadTelemetry = false, playerError = '';
-    var restorePaused = false, pendingResumeDeadline = 0;
-    var directUrl = '', directKey = '', directType = '', directHeight = 0;
-    var inputDialog = null, inputField = null, inputError = null;
-    var lastCommand = '', lastCommandAt = 0;
-    var directResolved = false;
-
+    var ORIGIN = 'https://cinesrc.st';
     var CONTROLLER = 'eltontv_cinesrc_remote';
     var EPISODE_KEY = 'eltontv_cinesrc_last_episode';
     var PROGRESS_KEY = 'eltontv_cinesrc_progress';
@@ -67,6 +59,7 @@
     var RESUME_END_GAP = 90;       // ...or the last 90 s (counts as finished)
     var SAVE_EVERY_MS = 15000;
     var PROGRESS_LIMIT = 300;      // remembered titles/episodes
+    var POINTER_FOCUS_MS = 5000;   // pointer mode: remote works again this long after a click
     var SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
 
     /* ---- the plugin's own subtitles ---- */
@@ -188,10 +181,6 @@
 
     function clearLoadTimers() {
         var key;
-        if (monitorTimer) clearInterval(monitorTimer);
-        if (loadTimer) clearTimeout(loadTimer);
-        if (speedTimer) clearTimeout(speedTimer);
-        monitorTimer = loadTimer = speedTimer = null;
         if (seekTimer) clearTimeout(seekTimer);
         if (osdTimer) clearTimeout(osdTimer);
         if (countdown && countdown.timer) clearInterval(countdown.timer);
@@ -205,9 +194,6 @@
     function resetLoad() {
         clearLoadTimers();
         ready = false;
-        hadTelemetry = false;
-        playerError = '';
-        lastCommand = '';
         paused = null;          // null = unknown
         time = null;
         timeAt = 0;             // when `time` was last reported
@@ -332,439 +318,10 @@
 
     function makeUrl() {
         var id = encodeURIComponent(String(media.id));
-        var start = resumeAt === null ? 0 : Math.floor(resumeAt);
-        if (provider.id === 'framextv') {
-            return ORIGIN + '/embed/' + id + (series ? '/' + season + '/' + episode : '') +
-                '?autoplay=1&controls=1&provider=archer&t=' + start;
-        }
-        if (provider.id === 'chillflix') {
-            return ORIGIN + '/embed/' + (series ? 'tv/' : 'movie/') + id +
-                (series ? '/' + season + '/' + episode : '') +
-                '?autoplay=true&prefer4k=1&title=false&watchparty=false&autonext=false&nextbutton=false&startAt=' + start;
-        }
-        return ORIGIN + '/embed/' + (series ? 'tv/' : 'movie/') + id + '?' +
-            (series ? 's=' + season + '&e=' + episode + '&' : '') +
-            'autoplay=true&controls=true&back=close&autonext=false&continueprompt=false&t=' + start +
-            (qualityPreference === 'auto' ? '' : '&quality=' + qualityPreference);
-    }
-
-    /* ---------- provider adapters and shared mouse controls ---------- */
-
-    function stopClick(event) {
-        if (event.preventDefault) event.preventDefault();
-        if (event.stopPropagation) event.stopPropagation();
-    }
-
-    function uiButton(label, action) {
-        var button = document.createElement('button');
-        button.type = 'button';
-        button.tabIndex = -1;
-        button.textContent = label;
-        button.style.cssText = 'border:1px solid #777;border-radius:0.7vh;background:#262626;color:white;' +
-            'font:500 2.1vh sans-serif;padding:1.3vh 1.6vh;margin:0.4vh;cursor:pointer;';
-        button.onclick = function (event) { stopClick(event); focusOverlay(); action(); };
-        return button;
-    }
-
-    function buildToolbar() {
-        toolbar = document.createElement('div');
-        toolbar.className = 'eltontv-toolbar';
-        toolbar.style.cssText = 'position:absolute;left:3%;right:3%;bottom:3%;z-index:10;' +
-            'background:rgba(0,0,0,.88);border-radius:1vh;padding:1vh;color:#fff;';
-        toolbar.onmousemove = showToolbar;
-        toolbar.onclick = function (event) { stopClick(event); };
-        toolbarTime = document.createElement('div');
-        toolbarTime.style.cssText = 'font:2.2vh sans-serif;padding:.6vh 1vh;';
-        toolbar.appendChild(toolbarTime);
-        toolbarSeek = document.createElement('input');
-        toolbarSeek.type = 'range';
-        toolbarSeek.min = '0';
-        toolbarSeek.max = '1000';
-        toolbarSeek.step = '1';
-        toolbarSeek.value = '0';
-        toolbarSeek.tabIndex = -1;
-        toolbarSeek.setAttribute('aria-label', 'Seek position');
-        toolbarSeek.style.cssText = 'width:98%;height:3vh;margin:0 1%;cursor:pointer;';
-        toolbarSeek.onchange = function () {
-            if (!provider.control || !duration) return;
-            resumeAt = null;
-            seekTarget = Math.min(duration - 0.1, Number(toolbarSeek.value) / 1000 * duration);
-            if (seekTimer) clearTimeout(seekTimer);
-            commitSeek();
-            focusOverlay();
-            showToolbar();
-        };
-        toolbar.appendChild(toolbarSeek);
-        toolbarPlay = uiButton('Play / Pause', togglePlayback);
-        toolbar.appendChild(toolbarPlay);
-        toolbar.appendChild(uiButton('−10s', function () { seekBy(-10); }));
-        toolbar.appendChild(uiButton('+10s', function () { seekBy(10); }));
-        toolbar.appendChild(uiButton('Menu', openMenu));
-        toolbar.appendChild(uiButton('Providers', function () { openMenu(); pushLevel('Providers', buildProviders); }));
-        toolbar.appendChild(uiButton('Web controls', function () { setPointerMode(true); }));
-        toolbar.appendChild(uiButton('Close', closePlayer));
-        overlay.appendChild(toolbar);
-
-        rescue = document.createElement('div');
-        rescue.className = 'eltontv-return-controls';
-        rescue.style.cssText = 'position:absolute;top:1.2vh;left:1.2vh;z-index:30;background:rgba(0,0,0,.8);border-radius:1vh;display:none;';
-        rescue.appendChild(uiButton('Return to remote', function () { setPointerMode(false); }));
-        rescue.appendChild(uiButton('Providers', function () { setPointerMode(false); openMenu(); pushLevel('Providers', buildProviders); }));
-        rescue.appendChild(uiButton('Close', closePlayer));
-        overlay.appendChild(rescue);
-    }
-
-    function showToolbar() {
-        if (!toolbar) return;
-        if (toolbarTimer) clearTimeout(toolbarTimer);
-        toolbar.style.display = pointerMode ? 'none' : 'block';
-        toolbarTimer = setTimeout(function () {
-            if (toolbar && !menu && !inputDialog) toolbar.style.display = 'none';
-        }, 4500);
-    }
-
-    function updateToolbar() {
-        if (!toolbarTime) return;
-        toolbarTime.textContent = provider.name + '  ·  ' + timeLabel();
-        toolbarPlay.textContent = paused === false ? 'Pause' : paused === true ? 'Play' : 'Play / Pause';
-        toolbarPlay.disabled = !provider.control;
-        var buttons = toolbar.getElementsByTagName ? toolbar.getElementsByTagName('button') : [];
-        for (var i = 0; i < buttons.length; i++) {
-            if (buttons[i].textContent === '−10s' || buttons[i].textContent === '+10s') buttons[i].disabled = !provider.control;
-            if (buttons[i].textContent === 'Web controls') buttons[i].disabled = provider.id === 'direct';
-        }
-        toolbarSeek.disabled = !provider.control || !duration;
-        if (document.activeElement !== toolbarSeek) toolbarSeek.value = String(Math.round(progress() * 1000));
-    }
-
-    function applyPointerMode() {
-        if (!overlay) return;
-        if (iframe) iframe.style.pointerEvents = pointerMode && !menu ? 'auto' : 'none';
-        if (clickShield) clickShield.style.display = pointerMode && !menu ? 'none' : 'block';
-        if (rescue) rescue.style.display = pointerMode ? 'block' : 'none';
-        if (toolbar) toolbar.style.display = pointerMode ? 'none' : 'block';
-    }
-
-    function qualitySummary() {
-        if (video && video.videoHeight) return video.videoWidth + ' × ' + video.videoHeight + ' decoded';
-        if (provider.id === 'cinesrc') return qualityPreference === 'auto' ? 'Provider Auto; resolution unreported' : qualityPreference + 'p requested; resolution unreported';
-        if (provider.id === 'framextv') return 'Archer selected; 4K availability unverified';
-        if (provider.id === 'chillflix') return 'Prefer 4K enabled; resolution unreported';
-        return 'Up to 2160p preferred; waiting for decoded video';
-    }
-
-    function buildQuality() {
-        var items = [{ label: 'Current quality', value: qualitySummary(), stacked: true, disabled: true }];
-        if (provider.id === 'cinesrc') {
-            ['2160', '1080', '720', 'auto'].forEach(function (quality) {
-                items.push({ label: quality === 'auto' ? 'Provider Auto' : 'Prefer ' + quality + 'p',
-                    current: qualityPreference === quality,
-                    action: function () { qualityPreference = quality; reloadProvider(); } });
-            });
-        } else if (hls && hls.levels) {
-            items.push({ label: 'Adaptive / Auto', current: hls.currentLevel === -1,
-                action: function () { hls.currentLevel = -1; closeMenu(); } });
-            hls.levels.forEach(function (level, index) {
-                items.push({ label: level.height + 'p', current: hls.currentLevel === index,
-                    action: function () { hls.currentLevel = index; closeMenu(); } });
-            });
-        } else {
-            items.push({ label: provider.id === 'direct' ? 'Quality follows the source / native HLS engine' : 'Choose quality inside Web controls',
-                stacked: true, disabled: true });
-        }
-        return items;
-    }
-
-    function buildProviders() {
-        var items = [];
-        PROVIDERS.forEach(function (entry) {
-            items.push({ label: entry.name, value: entry.detail, stacked: true, small: true,
-                current: provider.id === entry.id, action: function () {
-                    if (entry.id === 'direct' && !DIRECT_RESOLVER && (!directUrl || directKey !== progressId())) openDirectDialog();
-                    else chooseProvider(entry);
-                } });
-        });
-        items.push({ label: 'Enter / replace direct stream URL', action: openDirectDialog });
-        return items;
-    }
-
-    function buildVolumes() {
-        return [0, 0.25, 0.5, 0.75, 1].map(function (value) {
-            return { label: Math.round(value * 100) + '%', current: volume === value,
-                action: function () { setVolume(value); popLevel(); } };
-        });
-    }
-
-    function chooseProvider(entry) {
-        var at = resumeAt !== null ? resumeAt : position();
-        var wasPaused = paused === true;
-        saveProgress();
-        provider = entry;
-        ORIGIN = entry.origin;
-        pointerMode = !entry.control;
-        closeMenu();
-        load(at, wasPaused);
-        focusOverlay();
-    }
-
-    function reloadProvider() {
-        var at = resumeAt !== null ? resumeAt : position();
-        var wasPaused = paused === true;
-        saveProgress();
-        closeMenu();
-        load(at, wasPaused);
-        focusOverlay();
-    }
-
-    function destroySurface() {
-        if (hls) { try { hls.destroy(); } catch (ignored) {} hls = null; }
-        if (video) {
-            var oldVideo = video;
-            video = null;
-            try { oldVideo.pause(); oldVideo.removeAttribute('src'); oldVideo.load(); } catch (ignored) {}
-        }
-        if (iframe) { try { iframe.src = 'about:blank'; } catch (ignored) {} iframe = null; }
-        if (surface) while (surface.firstChild) surface.removeChild(surface.firstChild);
-    }
-
-    function createFrame() {
-        var generation = loadGeneration;
-        iframe = document.createElement('iframe');
-        iframe.title = provider.name + ' player';
-        iframe.tabIndex = -1;
-        iframe.setAttribute('frameborder', '0');
-        iframe.setAttribute('scrolling', 'no');
-        iframe.setAttribute('allow', 'autoplay; encrypted-media');
-        // Keep the host recovery button above the player. Frame fullscreen
-        // would place that cross-origin document above all parent controls.
-        iframe.style.cssText = 'display:block;width:100%;height:100%;border:0;background:#000;pointer-events:none;';
-        iframe.onload = function () {
-            if (!overlay || generation !== loadGeneration) return;
-            if (provider.id === 'cinesrc') {
-                request('getPaused', true);
-                request('getCurrentTime', true);
-            }
-            reclaimFocus();
-        };
-        iframe.src = makeUrl();
-        surface.appendChild(iframe);
-        if (provider.id === 'cinesrc') {
-            monitorTimer = setInterval(function () {
-                if (!overlay || generation !== loadGeneration) return;
-                request('getPaused');
-                request('getCurrentTime');
-                if (!duration) request('getDuration');
-                // Getter responses recover readiness when a ready event was missed.
-            }, 3000);
-        }
-    }
-
-    function playbackError(message) {
-        playerError = message;
-        osd('Playback needs attention', message, 0, 'Up / Down → Providers, or use the mouse controls.');
-        showToolbar();
-        refreshMenu();
-    }
-
-    function safeStreamUrl(value) {
-        if (typeof value !== 'string' || !/^https?:\/\//i.test(value.trim())) return '';
-        var anchor = document.createElement('a');
-        anchor.href = value.trim();
-        if ((anchor.protocol !== 'https:' && anchor.protocol !== 'http:') || !anchor.hostname) return '';
-        if (anchor.username || anchor.password) return '';
-        return anchor.href;
-    }
-
-    function openDirectDialog() {
-        closeMenu();
-        if (inputDialog) return;
-        inputDialog = document.createElement('div');
-        inputDialog.className = 'eltontv-url-dialog';
-        inputDialog.style.cssText = 'position:absolute;left:8%;right:8%;top:25%;z-index:40;background:#171717;color:white;border:1px solid #777;border-radius:1vh;padding:3vh;font:2.7vh sans-serif;';
-        var heading = document.createElement('div');
-        heading.textContent = 'Direct MP4 / HLS stream URL';
-        inputDialog.appendChild(heading);
-        inputField = document.createElement('input');
-        inputField.type = 'url';
-        inputField.placeholder = 'https://…/video.mp4 or …/master.m3u8';
-        inputField.value = directKey === progressId() ? directUrl : '';
-        inputField.style.cssText = 'display:block;width:100%;box-sizing:border-box;font:2.5vh sans-serif;padding:1.6vh;margin:2vh 0;color:#111;background:#fff;';
-        inputDialog.appendChild(inputField);
-        inputError = document.createElement('div');
-        inputError.style.cssText = 'font:2vh sans-serif;padding:1vh 0;';
-        inputError.textContent = 'Use a media URL, not an embed page. This URL applies only to this title / episode.';
-        inputDialog.appendChild(inputError);
-        inputDialog.appendChild(uiButton('Play URL', submitDirectUrl));
-        inputDialog.appendChild(uiButton('Cancel', closeDirectDialog));
-        overlay.appendChild(inputDialog);
-        inputField.focus();
-    }
-
-    function closeDirectDialog() {
-        if (!inputDialog) return;
-        if (inputDialog.parentNode) inputDialog.parentNode.removeChild(inputDialog);
-        inputDialog = inputField = inputError = null;
-        focusOverlay();
-    }
-
-    function submitDirectUrl() {
-        if (!inputField) return;
-        var url = safeStreamUrl(inputField.value);
-        if (!url) { inputError.textContent = 'Enter a complete HTTP or HTTPS media URL.'; inputField.focus(); return; }
-        directUrl = url;
-        directKey = progressId();
-        directType = /\.m3u8(?:[?#]|$)/i.test(url) ? 'hls' : '';
-        directHeight = 0;
-        directResolved = false;
-        closeDirectDialog();
-        chooseProvider(PROVIDERS[3]);
-    }
-
-    function loadDirect() {
-        var generation = loadGeneration;
-        if (DIRECT_RESOLVER && (!directUrl || directKey !== progressId() || directResolved)) {
-            var url = safeStreamUrl(DIRECT_RESOLVER);
-            if (!url) { playbackError('The direct resolver URL is invalid.'); return; }
-            url += (url.indexOf('?') >= 0 ? '&' : '?') + 'tmdb_id=' + encodeURIComponent(media.id) +
-                '&type=' + (series ? 'tv' : 'movie') + '&season=' + season + '&episode=' + episode + '&prefer_quality=2160';
-            http(url, false, function (body) {
-                if (!overlay || generation !== loadGeneration) return;
-                var response;
-                try { response = JSON.parse(body); } catch (ignored) {}
-                var sources = response && response.sources;
-                if (!isArray(sources)) { playbackError('Resolver returned no sources, or the request was blocked.'); return; }
-                sources = sources.filter(function (item) {
-                    return item && safeStreamUrl(item.url) && (!item.headers || Object.keys(item.headers).length === 0);
-                });
-                sources.sort(function (a, b) {
-                    // Prefer the highest declared height <=2160; unknown adaptive
-                    // manifests follow known heights; >2160 is a last resort.
-                    function rank(item) { var height = Number(item.height) || 0; return height > 2160 ? -height : height; }
-                    return rank(b) - rank(a);
-                });
-                if (!sources.length) { playbackError('No playable direct source. Required custom headers need a compatible relay.'); return; }
-                directUrl = safeStreamUrl(sources[0].url);
-                directKey = progressId();
-                directType = sources[0].type || '';
-                directHeight = Number(sources[0].height) || 0;
-                directResolved = true;
-                startNativeVideo();
-            });
-            return;
-        }
-        if (!directUrl || directKey !== progressId()) { openDirectDialog(); return; }
-        startNativeVideo();
-    }
-
-    function startNativeVideo() {
-        var generation = loadGeneration;
-        var element = video = document.createElement('video');
-        element.style.cssText = 'width:100%;height:100%;background:#000;object-fit:contain;';
-        element.setAttribute('playsinline', '');
-        element.preload = 'metadata';
-        element.controls = false;
-        element.autoplay = true;
-        surface.appendChild(element);
-        var events = ['loadedmetadata', 'canplay', 'timeupdate', 'play', 'pause', 'ended', 'seeked', 'volumechange', 'ratechange', 'error'];
-        events.forEach(function (name) {
-            element.addEventListener(name, function () {
-                if (!overlay || generation !== loadGeneration || element !== video) return;
-                if (name === 'error') { playbackError('Direct video failed: check URL, codec, CORS, expiry and TV support.'); return; }
-                if (name === 'canplay') {
-                    ready = true;
-                    if (restorePaused && resumeAt === null) { restorePaused = false; element.pause(); }
-                    return;
-                }
-                if (name === 'loadedmetadata') {
-                    ready = true;
-                    paused = element.paused;
-                    volume = element.volume;
-                    speed = element.playbackRate;
-                    time = element.currentTime;
-                }
-                receivePlayerEvent({ type: 'cinesrc:' + name, currentTime: element.currentTime,
-                    duration: element.duration, volume: element.volume, playbackRate: element.playbackRate });
-            }, false);
-        });
-        var isHls = /m3u8|mpegurl|^hls$/i.test(directType) || /\.m3u8(?:[?#]|$)/i.test(directUrl);
-        if (isHls && window.Hls && window.Hls.isSupported && window.Hls.isSupported()) {
-            hls = new window.Hls({ capLevelToPlayerSize: false });
-            hls.on(window.Hls.Events.MANIFEST_PARSED, function () {
-                if (generation !== loadGeneration || !hls) return;
-                var best = -1;
-                hls.levels.forEach(function (level, i) {
-                    if (level.height <= 2160 && (best < 0 || level.height > hls.levels[best].height)) best = i;
-                });
-                if (best >= 0) hls.currentLevel = best;
-                sendNative('play', []);
-            });
-            hls.on(window.Hls.Events.ERROR, function (event, data) {
-                if (generation === loadGeneration && data.fatal) playbackError('HLS playback failed. Try another source or quality.');
-            });
-            hls.loadSource(directUrl);
-            hls.attachMedia(element);
-        } else if (isHls && !element.canPlayType('application/vnd.apple.mpegurl') && !element.canPlayType('application/x-mpegURL')) {
-            playbackError('HLS is unsupported by this browser. Use native TV HLS or load a compatible Hls.js build.');
-        } else {
-            element.src = directUrl;
-            element.load();
-            sendNative('play', []);
-        }
-    }
-
-    function sendNative(command, args) {
-        if (!video) return false;
-        var result, element = video, generation = loadGeneration;
-        try {
-            if (command === 'play') {
-                var promise = element.play();
-                if (promise && promise.catch) promise.catch(function () {
-                    if (generation !== loadGeneration || video !== element) return;
-                    paused = true;
-                    updateToolbar();
-                    playbackError('Playback did not start. Press Play or try a supported source.');
-                });
-            } else if (command === 'pause') element.pause();
-            else if (command === 'seek') element.currentTime = args[0];
-            else if (command === 'setVolume') element.volume = args[0];
-            else if (command === 'setPlaybackRate') element.playbackRate = args[0];
-            else if (command === 'getPaused') result = element.paused;
-            else if (command === 'getCurrentTime') result = element.currentTime;
-            else if (command === 'getDuration') result = element.duration;
-            else if (command === 'getVolume') result = element.volume;
-            else if (command === 'getPlaybackRate') result = element.playbackRate;
-            else return false;
-            if (command.indexOf('get') === 0) onResponse({ command: command, result: result });
-            return true;
-        } catch (error) {
-            playbackError('Native player could not apply ' + command + '.');
-            return false;
-        }
-    }
-
-    function handleInternalEpisode(data) {
-        if (!series || !num(data.season) || !num(data.episode) || data.season < 1 || data.episode < 1) return;
-        if (data.season === season && data.episode === episode) return;
-        saveProgress();
-        season = Math.floor(data.season);
-        episode = Math.floor(data.episode);
-        saveLastEpisode(media.id, season, episode);
-        if (data.internalNavigation !== true) { load(); return; }
-        // Adopt the provider's navigation without loading a second episode.
-        if (seekTimer) clearTimeout(seekTimer);
-        if (countdown && countdown.timer) clearInterval(countdown.timer);
-        seekTimer = null;
-        countdown = null;
-        seekTarget = null;
-        seekDelta = pendingSeek = 0;
-        seekHoldUntil = 0;
-        time = duration = resumeAt = null;
-        timeAt = 0;
-        finished = false;
-        resetSubtitles();
-        if (SUBTITLES && subPrefs.lang) loadSubtitleList();
-        closeMenu();
-        updateToolbar();
+        var url = ORIGIN + '/embed/';
+        if (series) url += 'tv/' + id + '?s=' + season + '&e=' + episode + '&';
+        else url += 'movie/' + id + '?';
+        return url + 'autoplay=true' + (nativeControls ? '' : '&controls=false') + '&back=close';
     }
 
     /* ---------- storage: last episode, resume position ---------- */
@@ -834,24 +391,14 @@
     function maybeResume() {
         if (resumeAt === null || (!duration && time === null)) return;
         var at = resumeAt;
-        if (!provider.control) {
-            // This provider only accepts a startAt URL, not a seek command.
-            resumeAt = null;
-            return;
-        }
-        // Stored resume points were filtered in load(). A deliberate provider
-        // handoff must also preserve positions near the beginning or end.
-        if (duration && at >= duration) { at = Math.max(0, duration - 1); resumeAt = at; }
-        if (num(time) && Math.abs(time - at) < 3) {
-            resumeAt = null;
-            if (restorePaused) { restorePaused = false; pause(); }
-            return;
-        }
-        if (Date.now() < pendingResumeDeadline) return;
-        pendingResumeDeadline = Date.now() + 5000;
+        resumeAt = null;
+        if (duration && at > duration - RESUME_END_GAP) return;
+        seekTarget = at;
+        time = at;
+        timeAt = Date.now();
+        seekHoldUntil = Date.now() + SEEK_HOLD_MS;
         send('seek', [at]);
-        // Keep resumeAt until telemetry confirms; never save time zero over it.
-        osd('Resuming', formatTime(at), 0);
+        showPosition('Resumed');
     }
 
     /* ---------- episodes ---------- */
@@ -1027,24 +574,16 @@
     /* ---------- CineSrc commands ---------- */
 
     function send(command, args) {
-        args = args || [];
-        if (!provider.control) {
-            osd('Use web controls', '', 0, 'This provider has no documented playback command API.');
-            return false;
+        if (!iframe || !iframe.contentWindow) return;
+        try {
+            iframe.contentWindow.postMessage({
+                type: 'cinesrc:command',
+                command: command,
+                args: args || []
+            }, ORIGIN);
+        } catch (e) {
+            if (window.console) console.warn('EltonTV CineSrc command:', e);
         }
-        lastCommand = command;
-        lastCommandAt = Date.now();
-        if (provider.id === 'direct') return sendNative(command, args);
-        if (!iframe || !iframe.contentWindow) return false;
-        var payload = { type: 'cinesrc:command', command: command, args: args };
-        if (provider.id === 'framextv') {
-            if (command === 'play' || command === 'pause') payload = { action: command };
-            else if (command === 'seek') payload = { action: 'seek', time: args[0] };
-            else if (command === 'setVolume') payload = { action: 'setVolume', volume: args[0] };
-            else return false;
-        }
-        try { iframe.contentWindow.postMessage(payload, ORIGIN); return true; }
-        catch (e) { playbackError('Could not send player command.'); return false; }
     }
 
     // get* requests: one in flight per command, abandoned after a timeout so
@@ -1052,7 +591,6 @@
     // force = ask again even if an earlier ask is still waiting (used when
     // the player says it is ready: anything sent before that was lost).
     function request(command, force) {
-        if (!provider.getters) return;
         if (inflight[command]) {
             if (!force) return;
             clearTimeout(inflight[command]);
@@ -1095,36 +633,27 @@
     /* ---------- playback ---------- */
 
     function requireReady() {
-        if (!provider.control) {
-            osd('Mouse controls required', '', 0, 'Click Web controls, then use the provider player.');
-            return false;
-        }
         if (ready) return true;
-        osd('Player loading', '', 0, 'Use Play to retry, or open Providers.');
+        osd('Loading', '', 0);
         return false;
     }
 
     function play() {
-        if (!send('play')) return;
-        if (provider.id !== 'direct') paused = false;
-        showPosition(provider.id === 'direct' ? 'Play requested' : 'Play requested');
-        updateToolbar();
+        send('play');
+        paused = false;
+        showPosition('Playing');
     }
 
     function pause() {
-        if (!send('pause')) return;
-        if (provider.id !== 'direct') paused = true;
+        send('pause');
+        paused = true;
         userPauseAt = Date.now();
-        showPosition('Pause requested');
+        showPosition('Paused');
         saveProgress();
-        updateToolbar();
     }
 
     function togglePlayback() {
-        if (!provider.control) { requireReady(); return; }
-        // A user gesture must still reach a player whose autoplay was blocked.
-        if (!ready) { play(); return; }
-        if (paused === null && !provider.getters) { play(); return; }
+        if (!requireReady()) return;
         if (paused === null) {
             pendingToggle = true;
             request('getPaused');
@@ -1140,8 +669,7 @@
         var base = position();
         if (base === null) {
             pendingSeek += delta;
-            if (provider.getters) request('getCurrentTime');
-            else osd('Waiting for position', '', 0);
+            request('getCurrentTime');
             return;
         }
         var target = Math.max(0, base + delta);
@@ -1196,7 +724,6 @@
 
     function changeVolume(delta) {
         if (!requireReady()) return;
-        if (volume === null && !provider.getters) { pushLevel('Player volume', buildVolumes); return; }
         if (volume === null) {
             pendingVolume += delta;
             request('getVolume');
@@ -1206,13 +733,13 @@
     }
 
     function setSpeed(value) {
-        if (!provider.rate || !requireReady()) return;
-        if (!send('setPlaybackRate', [value])) return;
-        osd('Speed requested', speedLabel(value), 0);
-        var generation = loadGeneration;
-        if (speedTimer) clearTimeout(speedTimer);
-        speedTimer = setTimeout(function () {
-            if (overlay && generation === loadGeneration) request('getPlaybackRate');
+        if (!requireReady()) return;
+        send('setPlaybackRate', [value]);
+        speed = value;
+        osd('Speed', speedLabel(value), 0);
+        // Ask the player what it actually switched to.
+        setTimeout(function () {
+            if (overlay && ready) request('getPlaybackRate');
         }, 800);
     }
 
@@ -1642,12 +1169,12 @@
         menuBox.className = 'eltontv-menu';
         menuBox.style.cssText = 'position:absolute;top:0;right:0;bottom:0;width:64vh;max-width:92%;' +
             'box-sizing:border-box;background:rgba(0,0,0,0.86);color:#fff;' +
-            'font:500 2.6vh/1.3 sans-serif;display:none;pointer-events:auto;z-index:20;';
+            'font:500 2.6vh/1.3 sans-serif;display:none;pointer-events:none;';
         menuTitle = document.createElement('div');
         menuTitle.style.cssText = 'position:absolute;top:5vh;right:4.6vh;left:4.6vh;font-size:3.4vh;' +
             'font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
         menuList = document.createElement('div');
-        menuList.style.cssText = 'position:absolute;top:13vh;right:3vh;bottom:4vh;left:3vh;overflow-y:auto;';
+        menuList.style.cssText = 'position:absolute;top:13vh;right:3vh;bottom:4vh;left:3vh;overflow:hidden;';
         menuBox.appendChild(menuTitle);
         menuBox.appendChild(menuList);
         overlay.appendChild(menuBox);
@@ -1676,19 +1203,6 @@
                 (item.small ? DETAIL_CSS : '');
             value.textContent = item.value;
             row.appendChild(value);
-        }
-        if (!item.disabled) {
-            row.style.cursor = 'pointer';
-            row.onclick = function (event) {
-                stopClick(event);
-                focusOverlay();
-                armMenuIdle();
-                if (item.action) item.action();
-            };
-            if (item.adjust) {
-                row.appendChild(uiButton('−', function () { item.adjust(-1); armMenuIdle(); }));
-                row.appendChild(uiButton('+', function () { item.adjust(1); armMenuIdle(); }));
-            }
         }
         return row;
     }
@@ -1727,8 +1241,7 @@
         }
 
         scroll = menuList.scrollTop;
-        menuTitle.textContent = level.title + '  /  Back';
-        menuTitle.onclick = function (event) { stopClick(event); popLevel(); focusOverlay(); };
+        menuTitle.textContent = level.title;
         while (menuList.firstChild) menuList.removeChild(menuList.firstChild);
         for (i = 0; i < items.length; i++) {
             menuList.appendChild(rowElement(items[i], i === level.index));
@@ -1752,7 +1265,6 @@
         menuTimer = null;
         menu = null;
         if (menuBox) menuBox.style.display = 'none';
-        applyPointerMode();
     }
 
     function pushLevel(title, build) {
@@ -1771,9 +1283,7 @@
 
     function openMenu() {
         if (!menuBox || menu) return;
-        focusOverlay();
         pushLevel(media.title || media.name || 'Player', buildRoot);
-        applyPointerMode();
         armMenuIdle();
         syncPlayer(false);
     }
@@ -1963,12 +1473,7 @@
     }
 
     function buildRoot() {
-        var items = [
-            { label: 'Providers', value: provider.name, action: function () { pushLevel('Providers', buildProviders); } },
-            { label: 'Play', disabled: !provider.control, action: play },
-            { label: 'Pause', disabled: !provider.control, action: pause },
-            { label: 'Quality', value: qualitySummary(), action: function () { pushLevel('Quality', buildQuality); } }
-        ];
+        var items = [];
         var next, prev;
         if (series) {
             next = neighbour(1);
@@ -2007,30 +1512,24 @@
         }
         items.push({
             label: 'Speed',
-            disabled: !provider.rate,
             value: speed === null ? '' : speedLabel(speed),
             action: function () { pushLevel('Speed', buildSpeeds); }
         });
         items.push({
             label: 'Player volume',
-            disabled: !provider.control,
             value: volume === null ? '< >' : '< ' + Math.round(volume * 100) + '% >',
-            action: function () { pushLevel('Player volume', buildVolumes); },
             adjust: function (direction) { changeVolume(direction * VOLUME_STEP); }
         });
-        items.push({ label: 'Start from the beginning', disabled: !provider.control, action: restart });
+        items.push({ label: 'Start from the beginning', action: restart });
         items.push({
-            label: pointerMode ? 'Return to remote' : 'Web player controls',
-            disabled: provider.id === 'direct',
-            value: pointerMode ? 'or click the corner button' : 'mouse; quality / audio / servers',
+            label: pointerMode ? 'Back to the remote' : 'CineSrc\'s own controls',
+            value: pointerMode ? '' : 'needs a mouse',
             action: function () { setPointerMode(!pointerMode); }
         });
         items.push({
             label: 'Diagnostics',
             action: function () { pushLevel('Diagnostics', buildDiagnostics); }
         });
-        items.push({ label: 'Reload this provider', action: reloadProvider });
-        items.push({ label: 'Close player', action: closePlayer });
         return items;
     }
 
@@ -2040,12 +1539,6 @@
         var silent = [];
         var items = [];
         var key;
-        items.push({ label: 'Provider', value: provider.name, stacked: true });
-        items.push({ label: 'Connection', value: hadTelemetry ? 'Player events received' : 'No player events yet', stacked: true });
-        items.push({ label: 'Control support', value: provider.control ? 'Commands supported by adapter; verify on this TV' : 'Web player only', stacked: true });
-        items.push({ label: 'Quality', value: qualitySummary(), stacked: true });
-        items.push({ label: 'Last command sent', value: lastCommand || 'none', stacked: true });
-        if (playerError) items.push({ label: 'Error', value: playerError, stacked: true });
         for (key in diag.types) types.push(key.replace('cinesrc:', '') + ' x' + diag.types[key]);
         for (key in diag.asked) {
             if (diag.answered[key]) answered.push(key);
@@ -2062,13 +1555,13 @@
         });
         items.push({ label: 'Commands it answered', value: answered.join(', ') || 'none', stacked: true });
         items.push({ label: 'Commands it ignored', value: silent.join(', ') || 'none', stacked: true });
-        items.push({ label: 'Server reported by player', value: sourceId || 'not reported', stacked: true });
+        items.push({ label: 'CineSrc server in use', value: sourceId || 'not reported', stacked: true });
         items.push({
             label: 'Subtitle sources',
             value: subNotes.length ? subNotes.join('; ') : (subStatus === 'loading' ? 'searching' : 'not asked yet'),
             stacked: true
         });
-        items.push({ label: 'Expected player address', value: ORIGIN || 'Native video', stacked: true });
+        items.push({ label: 'Expected player address', value: ORIGIN, stacked: true });
         if (diag.foreign) {
             items.push({ label: 'Messages ignored from', value: diag.foreign, stacked: true });
         }
@@ -2157,42 +1650,19 @@
 
     function onMessage(event) {
         if (!overlay || !iframe || event.source !== iframe.contentWindow || !event.data) return;
-        var allowed = event.origin === ORIGIN ||
-            (provider.id === 'chillflix' && event.origin === 'https://chillflix.pw');
-        if (!allowed) { diag.foreign = String(event.origin); return; }
-        var data = event.data;
-        if (typeof data === 'string') {
-            if (data.length > 65536) return;
-            try { data = JSON.parse(data); } catch (ignored) { return; }
+        if (event.origin !== ORIGIN) {
+            diag.foreign = String(event.origin); // shown in Diagnostics
+            return;
         }
-        if (!data || typeof data !== 'object') return;
-        if (provider.id === 'framextv') {
-            if (typeof data.event !== 'string' || data.event.indexOf('frameXTV:') !== 0) return;
-            data = { type: 'cinesrc:' + data.event.slice(9), currentTime: data.currentTime,
-                duration: data.duration, volume: data.volume, error: data.error };
-        } else if (provider.id === 'chillflix') {
-            if (data.type !== 'PLAYER_EVENT' || !data.data) return;
-            data = data.data;
-            if (String(data.tmdbId) !== String(media.id)) return;
-            if (series && (Number(data.season) !== season || Number(data.episode) !== episode)) return;
-            data = { type: 'cinesrc:' + data.event, currentTime: data.currentTime, duration: data.duration };
-        }
-        receivePlayerEvent(data);
-    }
 
-    function receivePlayerEvent(data) {
+        var data = event.data;
         var type = typeof data.type === 'string' ? data.type : '';
         if (type.indexOf('cinesrc:') !== 0) return;
-        if (type === 'cinesrc:nextepisode') { handleInternalEpisode(data); return; }
-        if (type !== 'cinesrc:error') {
-            hadTelemetry = true;
-            if (loadTimer) clearTimeout(loadTimer);
-            loadTimer = null;
-        }
+
         var fresh = !diag.types[type];
         diag.types[type] = (diag.types[type] || 0) + 1;
         if (type !== 'cinesrc:response') diag.last[type] = compact(data, ['type']);
-        if (!ready && type !== 'cinesrc:error') {
+        if (!ready) {
             ready = true; // any message from the player means it is loading
             if (type !== 'cinesrc:ready') syncPlayer(false);
         }
@@ -2227,10 +1697,6 @@
             case 'cinesrc:loadedmetadata':
                 if (num(data.duration) && data.duration > 0) duration = data.duration;
                 break;
-            case 'cinesrc:ratechange':
-                if (num(data.playbackRate)) speed = data.playbackRate;
-                refreshMenu();
-                break;
             case 'cinesrc:volumechange':
                 if (num(data.volume)) {
                     volume = data.volume;
@@ -2246,7 +1712,6 @@
             case 'cinesrc:timeupdate':
                 if (num(data.duration) && data.duration > 0) duration = data.duration;
                 if (num(data.currentTime) && !seekBusy()) {
-                    if (provider.id === 'framextv' && num(time) && data.currentTime > time && Date.now() - lastCommandAt > 1000) paused = false;
                     time = data.currentTime;
                     timeAt = Date.now();
                     seekTarget = null;
@@ -2261,14 +1726,12 @@
                 closePlayer();
                 break;
             case 'cinesrc:error':
-                playbackError('Provider playback error. Use Providers or Reload.');
+                notify('CineSrc playback error. Try another title or source.');
                 break;
         }
 
         if (!overlay) return;
         maybeResume();
-        if (pendingSeek && num(time)) { var queued = pendingSeek; pendingSeek = 0; seekBy(queued); }
-        updateToolbar();
         if (fresh) refreshMenu();
     }
 
@@ -2302,16 +1765,7 @@
             return;
         }
 
-        if (code === 447 || code === 448 || code === 449 || code === 173 || code === 174 || code === 175) return;
-        if (inputDialog) {
-            if (isBackKey(code) && (code !== 8 || document.activeElement !== inputField)) {
-                stopKey(event); closeDirectDialog();
-            } else if (code === 13) {
-                stopKey(event); submitDirectUrl();
-            } else if (event.stopImmediatePropagation) event.stopImmediatePropagation();
-            return;
-        }
-        stopKey(event); // Lampa sees no playback key while the player is open
+        stopKey(event); // Lampa sees nothing while the player is open
         var repeat = !!event.repeat;
 
         if (menu) {
@@ -2338,10 +1792,10 @@
                 if (!repeat) togglePlayback();
                 break;
             case 415:      // MediaPlay
-                if (!repeat) play();
+                if (!repeat && requireReady()) play();
                 break;
             case 19:       // MediaPause
-                if (!repeat) pause();
+                if (!repeat && requireReady()) pause();
                 break;
             case 37:       // Left
             case 412:      // MediaRewind
@@ -2380,9 +1834,6 @@
     }
 
     function onKeyUp(event) {
-        var hardware = event.keyCode || event.which;
-        if (hardware === 447 || hardware === 448 || hardware === 449 || hardware === 173 || hardware === 174 || hardware === 175) return;
-        if (inputDialog) { if (event.stopImmediatePropagation) event.stopImmediatePropagation(); return; }
         if (overlay) {
             stopKey(event);
             return;
@@ -2421,16 +1872,14 @@
     }
 
     // If focus lands in the iframe, keys go to CineSrc instead of this plugin.
-    // Reclaim only in parent-controls mode. Web menus keep their focus.
+    // Take it back: at once normally, after a short grace in pointer mode so
+    // CineSrc's own menus can be clicked through.
     function reclaimFocus() {
         if (focusTimer) clearTimeout(focusTimer);
-        focusTimer = null;
-        // Never steal focus while the viewer is using a cross-origin menu.
-        if (pointerMode || inputDialog || document.hidden) return;
         focusTimer = setTimeout(function () {
             focusTimer = null;
-            if (overlay && !pointerMode && !inputDialog && document.activeElement === iframe) focusOverlay();
-        }, 0);
+            if (overlay && document.activeElement === iframe) focusOverlay();
+        }, pointerMode ? POINTER_FOCUS_MS : 0);
     }
 
     // Pointer mode lets a mouse use CineSrc's own controls, which is the only
@@ -2438,21 +1887,19 @@
     // and its own subtitles. The remote keeps working whenever focus is back
     // with the plugin.
     function setPointerMode(on) {
-        if (!overlay || provider.id === 'direct') return;
-        pointerMode = !!on;
-        if (focusTimer) clearTimeout(focusTimer);
-        focusTimer = null;
+        if (!overlay || on === pointerMode) return;
+        pointerMode = on;
         closeMenu();
-        applyPointerMode();
+        iframe.style.pointerEvents = on ? 'auto' : 'none';
         if (on) {
-            osd('Web controls', '', 0, 'Use the mouse. Click Return to remote at top left when finished.');
+            if (!nativeControls) {
+                saveProgress();
+                load(); // reload once with CineSrc's controls visible
+            }
+            osd('Mouse mode', '', 0, 'Click in the video to use CineSrc\'s controls. Back returns to the remote.');
         } else {
-            if (!provider.getters) { paused = null; volume = null; }
-            else if (ready) request('getPaused', true);
             focusOverlay();
-            showToolbar();
-            updateToolbar();
-            osd('Remote + mouse controls', '', 0);
+            osd('Remote control', '', 0);
         }
     }
 
@@ -2494,35 +1941,22 @@
     /* ---------- open / load / close ---------- */
 
     // (Re)loads the iframe for the current title or episode.
-    function load(startAt, keepPaused) {
+    function load() {
         var saved;
-        closeDirectDialog();
         resetLoad();
         resetSubtitles();
-        loadGeneration++;
-        destroySurface();
-        nativeControls = true;
-        restorePaused = keepPaused === true;
-        pendingResumeDeadline = 0;
-        if (num(startAt)) resumeAt = Math.max(0, startAt);
-        else if (RESUME) {
+        nativeControls = pointerMode;
+        if (RESUME) {
             saved = readMap(PROGRESS_KEY)[progressId()];
-            if (saved && saved.t >= RESUME_MIN && (!saved.d || saved.t < saved.d - RESUME_END_GAP)) resumeAt = saved.t;
+            if (saved && saved.t > RESUME_MIN && (!saved.d || saved.t < saved.d - RESUME_END_GAP)) {
+                resumeAt = saved.t;
+            }
         }
-        if (provider.id === 'direct') loadDirect();
-        else createFrame();
-        applyPointerMode();
-        osd(provider.name, 'Loading', 0);
+        iframe.src = makeUrl();
+        osd(series ? episodeLabel({ s: season, e: episode }) : 'Loading', series ? 'Loading' : '', 0);
+        // A language chosen earlier comes back by itself.
         if (SUBTITLES && subPrefs.lang) loadSubtitleList();
         refreshMenu();
-        updateToolbar();
-        showToolbar();
-        var generation = loadGeneration;
-        loadTimer = setTimeout(function () {
-            if (overlay && generation === loadGeneration && !hadTelemetry) {
-                playbackError('No playback events received. Try Play, Web controls, or another provider.');
-            }
-        }, 25000);
     }
 
     function closePlayer() {
@@ -2530,12 +1964,7 @@
         saveProgress();
 
         var oldOverlay = overlay;
-        loadGeneration++;
-        closeDirectDialog();
-        destroySurface();
-        if (toolbarTimer) clearTimeout(toolbarTimer);
-        toolbarTimer = null;
-        toolbar = rescue = toolbarTime = toolbarSeek = toolbarPlay = clickShield = surface = null;
+        var oldFrame = iframe;
         clearLoadTimers();
         resetSubtitles();
         if (menuTimer) clearTimeout(menuTimer);
@@ -2560,6 +1989,9 @@
         setTvScreensaver(true);
         resumeLampaScreensaver();
 
+        if (oldFrame) {
+            try { oldFrame.src = 'about:blank'; } catch (ignored) {}
+        }
         if (oldOverlay.parentNode) oldOverlay.parentNode.removeChild(oldOverlay);
         document.body.style.overflow = previousOverflow;
 
@@ -2576,8 +2008,6 @@
         }
         if (overlay) closePlayer();
 
-        provider = PROVIDERS[0];
-        ORIGIN = provider.origin;
         media = movie;
         series = isSeries(movie);
         season = series ? positiveInt(s) : 0;
@@ -2594,23 +2024,24 @@
         overlay = document.createElement('div');
         overlay.className = 'eltontv-fullscreen';
         overlay.tabIndex = 0;
-        overlay.setAttribute('aria-label', 'EltonTV fullscreen video');
+        overlay.setAttribute('aria-label', 'CineSrc fullscreen video');
         overlay.style.cssText = 'position:fixed;top:0;right:0;bottom:0;left:0;' +
             'width:100%;height:100%;z-index:2147483647;background:#000;' +
             'margin:0;padding:0;border:0;overflow:hidden;outline:none;';
 
-        surface = document.createElement('div');
-        surface.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;';
-        overlay.appendChild(surface);
-        clickShield = document.createElement('div');
-        clickShield.className = 'eltontv-click-shield';
-        clickShield.style.cssText = 'position:absolute;inset:0;top:0;left:0;right:0;bottom:0;cursor:pointer;';
-        clickShield.onclick = function (event) { stopClick(event); focusOverlay(); if (menu) closeMenu(); else togglePlayback(); showToolbar(); };
-        clickShield.onmousemove = showToolbar;
-        overlay.appendChild(clickShield);
+        iframe = document.createElement('iframe');
+        iframe.title = 'CineSrc player';
+        iframe.tabIndex = -1;
+        iframe.setAttribute('frameborder', '0');
+        iframe.setAttribute('scrolling', 'no');
+        iframe.setAttribute('allow', 'autoplay; fullscreen; picture-in-picture');
+        iframe.setAttribute('allowfullscreen', '');
+        iframe.style.cssText = 'display:block;width:100%;height:100%;border:0;' +
+            'margin:0;padding:0;background:#000;pointer-events:none;';
+        iframe.addEventListener('load', reclaimFocus, false);
+        overlay.appendChild(iframe);
         if (SUBTITLES) buildSubtitleBox();
         if (SHOW_OSD) buildOsd();
-        buildToolbar();
         buildMenu();
         document.body.appendChild(overlay);
         document.body.style.overflow = 'hidden';
@@ -2735,7 +2166,7 @@
         if (!buttons.length || buttons.find('.view--eltontv').length) return;
 
         var button = window.jQuery(
-            '<div class="full-start__button full-start-new__button selector view--eltontv"><span>EltonTV</span></div>'
+            '<div class="full-start__button full-start-new__button selector view--eltontv"><span>CineSrc</span></div>'
         );
         // Lampa already turns mouse clicks into hover:enter.
         button.on('hover:enter', function () { start(movie); });
@@ -2750,9 +2181,9 @@
         if (Lampa.Manifest) {
             Lampa.Manifest.plugins = {
                 type: 'video',
-                version: '2.5.0',
-                name: 'EltonTV - Remote + Mouse',
-                description: 'CineSrc, provider adapters and direct video with remote + mouse controls'
+                version: '2.4.0',
+                name: 'EltonTV CineSrc - Fullscreen Remote',
+                description: 'Fullscreen CineSrc with Samsung TV remote controls'
             };
         }
         Lampa.Listener.follow('full', addButton);
